@@ -26,6 +26,77 @@ git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout 
 проходят в `.venv` (transformers 4.37.2 поверх torch 2.14); экстры `train`/`flash` здесь не собираются из-за
 отсутствия `nvcc`, их проверяет `pytest test_pipeline.py -q` на машине с CUDA toolkit.
 
+## Запуск на сервере: полный набор команд
+
+Пути `/data/trajectories`, `<user>@<host>` замените на свои. Команды идут по порядку, каждый следующий шаг
+предполагает, что предыдущий отработал.
+
+**1. Данные на сервер** (с рабочей машины, один раз; png не хранятся в git):
+
+```bash
+rsync -a --info=progress2 ~/Documents/vlmfinetuning/INTACT-pi0-scratch-bridge/ <user>@<host>:/data/trajectories/INTACT-pi0-scratch-bridge/
+```
+
+**2. Код и окружение** (на сервере):
+
+```bash
+git clone git@github.com:JohnSili/InternVL_ICRA_training.git vlmfinetuning && cd vlmfinetuning
+uv sync                                    # torch, transformers 4.37.2, peft, tensorboard, pytest
+uv sync --extra train --extra flash        # deepspeed + flash-attn, компилируются, нужен nvcc; MAX_JOBS=8 ускорит
+git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout -q 2410d1dbf208f0e799459aff9376e5747dbf41a2
+source .venv/bin/activate
+```
+
+**3. Данные и предполётные проверки:**
+
+```bash
+export VLA_META_ROOT=/data/trajectories
+python3 validate_dataset.py                                                        # hard-проверки должны быть зелёные
+python3 prepare_data.py --root $VLA_META_ROOT --out data/cls --holdout-list data/cls/heldout.txt
+pytest test_pipeline.py -q -m "not gpu and not slow"                               # секунды
+pytest test_pipeline.py -q                                                         # с GPU-смоуком: два шага тренера, память, чекпоинт
+```
+
+`--holdout-list data/cls/heldout.txt` обязателен: файл лежит в репозитории, и без него held-out нарежется заново.
+
+**4. Точка отсчёта до обучения** (zero-shot, должен совпасть с majority):
+
+```bash
+python3 evaluate.py --data data/cls/heldout.jsonl --group-by agent
+python3 evaluate.py --data data/cls/val.jsonl
+```
+
+**5. Обучение** (под `tmux` или `nohup`, чтобы пережило обрыв ssh):
+
+```bash
+DATA=data/cls bash train.sh 2>&1 | tee train_cls.log
+```
+
+Сам поднимет TensorBoard на 6006 и наблюдатель по val, в конце запишет `work_dirs/cls/best_checkpoint.txt`.
+С рабочей машины: `ssh -L 6006:localhost:6006 <user>@<host>`, затем http://localhost:6006.
+
+**6. Итоговая оценка на held-out:**
+
+```bash
+python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --group-by agent --tensorboard work_dirs/cls/tensorboard
+```
+
+Сравнивать строку модели со строкой `majority` в том же выводе. Результат в `data/cls/eval/heldout_checkpoint-N/`.
+
+**Варианты:**
+
+```bash
+PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACC=16 DATA=data/cls bash train.sh          # если OOM
+python3 prepare_data.py --root $VLA_META_ROOT --out data/obs --target obs --balance --drop-recovery --holdout-list data/cls/heldout.txt
+DATA=data/obs bash train.sh                                                  # ответ <класс>|<симптом>, oversampling редких классов
+for fs in surr2 uniform dense_sparse; do                                     # ablation по стратегии отбора кадров
+  python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --frame-selection $fs
+done
+```
+
+После шага 2 голый `uv sync` больше не запускать: он удалит deepspeed и flash-attn. Пересинхронизация только
+с `--extra train --extra flash`.
+
 ## Скрипты
 
 Четыре скрипта, общаются через файлы:

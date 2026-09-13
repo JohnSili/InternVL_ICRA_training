@@ -132,6 +132,33 @@ done
 После шага 3 голый `uv sync` больше не запускать: он удалит deepspeed и flash-attn. Пересинхронизация только
 с `--extra train --extra flash`.
 
+### Отложенные варианты разбивки
+
+Не сделано намеренно, сделать при наличии времени после первого прогона. Held-out при обеих пересборках
+не меняется: он зафиксирован списком `data/cls/heldout400.txt`.
+
+**Oversampling под macro-F1.** В gt-разметке класс C редкий (291 из 8000, 3.6%; в train 267, в val 8,
+в held-out 16), а macro-F1 усредняет классы поровну, поэтому итог заметно болтается из-за C.
+`--balance` при потолке x5 даёт C x5 и D x3, train растёт примерно до 10 тысяч, эпоха длиннее на треть:
+
+```bash
+python3 prepare_data.py --out data/cls_bal --holdout-list data/cls/heldout400.txt --holdout-per-group 50 --val-frac 0.03 --balance
+DATA=data/cls_bal bash train.sh
+```
+
+**Второй замер по ручной разметке.** Held-out на gt-метках отвечает на вопрос «выучила ли модель
+разметчика». Чтобы получить согласие с человеком, нужен тот же held-out с ручными метками:
+
+```bash
+python3 prepare_data.py --out data/cls_manual --holdout-list data/cls/heldout400.txt --holdout-src manual --val-frac 0.03
+python3 evaluate.py --data data/cls_manual/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --group-by agent
+```
+
+Ручная разметка есть только у 141 эпизода, поэтому пересечение с held-out будет небольшим. Согласие двух
+разметок на этих 141: 66.7%. По классам оно неравномерно: E совпадает полностью (52 из 52), а из 17 эпизодов,
+размеченных человеком как C, gt не назвал C ни одного (12 ушли в B, 4 в E, 1 в D). Это потолок для любого
+сравнения с человеческим суждением и причина не ждать высокого macro-F1 на классе C.
+
 ## Скрипты
 
 Четыре скрипта, общаются через файлы:

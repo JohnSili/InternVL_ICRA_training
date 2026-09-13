@@ -126,7 +126,7 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="session")
 def dataset(request):
-    root = os.environ.get("VLA_META_ROOT", "/data/trajectories")
+    root = os.path.expanduser(os.environ.get("VLA_META_ROOT", "/data/trajectories"))
     assert os.path.isdir(root), f"VLA_META_ROOT не существует: {root}"
     limit = request.config.getoption("--limit", None) or os.environ.get("VLA_META_LIMIT")
     seed = request.config.getoption("--seed", None)

@@ -29,8 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from prepare_data import CLASSES, OBSERVATIONS  # noqa: E402  словарь ответов — тот же, что у генератора
 
-META_ROOT = os.environ.get("VLA_META_ROOT", "/data/trajectories")
-DATA_OUT = os.path.abspath(os.environ.get("VLA_DATA_OUT", os.path.join(HERE, "data", "cls")))
+META_ROOT = os.path.expanduser(os.environ.get("VLA_META_ROOT", "/data/trajectories"))
+DATA_OUT = os.path.abspath(os.path.expanduser(os.environ.get("VLA_DATA_OUT", os.path.join(HERE, "data", "cls"))))
 MODEL = os.environ.get("VLA_MODEL", "OpenGVLab/InternVL3-2B")
 N_FRAMES = int(os.environ.get("VLA_N_FRAMES", 16))  # контракт: столько кадров ждёт тренер и evaluate.py
 TRAIN_SH = os.path.join(HERE, "train.sh")

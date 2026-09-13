@@ -275,6 +275,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+    for k in ("data", "lora", "out_dir", "from_predictions", "tensorboard"):  # "~" в argparse не раскрывается сам
+        if getattr(args, k):
+            setattr(args, k, os.path.expanduser(getattr(args, k)))
     if args.tb_tag:
         tb_tag = args.tb_tag
     elif args.from_predictions:  # имя папки оценки, например heldout_base

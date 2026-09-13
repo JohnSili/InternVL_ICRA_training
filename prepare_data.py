@@ -255,10 +255,11 @@ def write_jsonl(path, records):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default="/data/trajectories", help="корень с <агент>/{meta,frames}")
-    ap.add_argument("--ann-root", default=None, metavar="DIR",
+    ap.add_argument("--root", default=os.environ.get("VLA_META_ROOT", "/data/trajectories"),
+                    help="корень с <агент>/{meta,frames}; по умолчанию $VLA_META_ROOT")
+    ap.add_argument("--ann-root", default=os.environ.get("VLA_ANN_ROOT") or None, metavar="DIR",
                     help="корень с gt-разметкой <агент>/<имя>_auto.json: метки train и val берутся оттуда, "
-                         "held-out всегда по ручной разметке из meta")
+                         "held-out всегда по ручной разметке из meta; по умолчанию $VLA_ANN_ROOT")
     ap.add_argument("--drop-unresolved", action="store_true",
                     help="убрать из train и val эпизоды с unresolved=true в gt-разметке")
     ap.add_argument("--out", default="data/cls")
@@ -272,6 +273,13 @@ def main():
     ap.add_argument("--copies", type=int, default=1, help="копий train с разным джиттером (по одной на эпоху)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    for k in ("root", "ann_root", "out", "holdout_list"):  # "~" в argparse не раскрывается сам
+        if getattr(args, k):
+            setattr(args, k, os.path.expanduser(getattr(args, k)))
+    if not os.path.isdir(args.root):
+        sys.exit(f"--root {args.root} не существует (или задайте VLA_META_ROOT)")
+    if args.ann_root and not os.path.isdir(args.ann_root):
+        sys.exit(f"--ann-root {args.ann_root} не существует")
 
     os.makedirs(args.out, exist_ok=True)
     eps = load_episodes(args.root, args.ann_root)

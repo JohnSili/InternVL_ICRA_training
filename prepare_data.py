@@ -41,6 +41,7 @@ OBSERVATIONS = [
     "end_effector_moves_away_from_target",
     "object_released_outside_target",
     "object_remains_in_gripper",
+    "object_dropped_during_transport",  # из gt-разметки, в словаре ТЗ его нет
 ]
 
 # Эталонный текст human-хода (16 x "Frame k: <image>" + инструкция + описание классов) лежит в

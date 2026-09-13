@@ -28,10 +28,13 @@ git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout 
 
 ## Запуск на сервере: полный набор команд
 
-Команды идут по порядку, каждый следующий шаг предполагает, что предыдущий отработал. Корень данных на
-сервере: `~/Simpler/trajectories` (внутри папки агентов `INTACT-pi0-scratch-bridge`, `openvla-7b`, у каждого
-`meta/` и `frames/`); соседняя `~/Simpler/gt` к пайплайну не относится. Неразмеченные эпизоды (без `class_key`
-из A–E) валидатор и `prepare_data.py` считают и пропускают, в обучение они не попадают.
+Команды идут по порядку, каждый следующий шаг предполагает, что предыдущий отработал.
+
+Два корня данных на сервере. `~/Simpler/trajectories` — кадры и `actions`: папки агентов
+`INTACT-pi0-scratch-bridge`, `openvla-7b`, у каждого `meta/` и `frames/`; в `meta` лежит **ручная** разметка.
+`~/Simpler/gt` — **gt-разметка**, по файлу `<имя>_auto.json` на траекторию, поля `annotation` там на верхнем
+уровне рядом с `class_key`. Учимся по gt, а held-out держим на ручной, потому что она эталон. Неразмеченные
+эпизоды (нет `class_key` из A–E в выбранном источнике) считаются и пропускаются.
 
 **1. Данные на сервер** — только если их там ещё нет (png не хранятся в git):
 
@@ -67,14 +70,21 @@ source .venv/bin/activate
 **4. Данные и предполётные проверки:**
 
 ```bash
-export VLA_META_ROOT=~/Simpler/trajectories
-python3 validate_dataset.py                                                        # hard-проверки должны быть зелёные
-python3 prepare_data.py --root $VLA_META_ROOT --out data/cls --holdout-list data/cls/heldout.txt
+export VLA_META_ROOT=~/Simpler/trajectories VLA_ANN_ROOT=~/Simpler/gt
+python3 validate_dataset.py                                                        # проверяет gt-разметку
+VLA_ANN_ROOT= python3 validate_dataset.py                                          # то же по ручной разметке
+python3 prepare_data.py --root $VLA_META_ROOT --ann-root $VLA_ANN_ROOT --out data/cls --holdout-list data/cls/heldout.txt
 pytest test_pipeline.py -q -m "not gpu and not slow"                               # секунды
 pytest test_pipeline.py -q                                                         # с GPU-смоуком: два шага тренера, память, чекпоинт
 ```
 
 `--holdout-list data/cls/heldout.txt` обязателен: файл лежит в репозитории, и без него held-out нарежется заново.
+Без `--ann-root` метки для train и val берутся из ручной разметки, поведение прежнее.
+
+`prepare_data.py` напечатает согласие двух разметок на пересечении и первые расхождения. Это число — потолок:
+если gt и ручная совпадают, скажем, на 85%, то macro-F1 выше 0.85 на ручном held-out ждать не стоит, как бы
+хорошо модель ни выучила gt. Если расхождений много, смотреть надо на них, а не на гиперпараметры.
+`--drop-unresolved` выкидывает из train и val эпизоды, которые авторазметчик пометил как нерешённые.
 
 **5. Точка отсчёта до обучения** (zero-shot, должен совпасть с majority):
 
@@ -104,7 +114,7 @@ python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/bes
 
 ```bash
 PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACC=16 DATA=data/cls bash train.sh          # если OOM
-python3 prepare_data.py --root $VLA_META_ROOT --out data/obs --target obs --balance --drop-recovery --holdout-list data/cls/heldout.txt
+python3 prepare_data.py --root $VLA_META_ROOT --ann-root $VLA_ANN_ROOT --out data/obs --target obs --balance --drop-recovery --holdout-list data/cls/heldout.txt
 DATA=data/obs bash train.sh                                                  # ответ <класс>|<симптом>, oversampling редких классов
 for fs in surr2 uniform dense_sparse; do                                     # ablation по стратегии отбора кадров
   python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --frame-selection $fs
@@ -121,7 +131,7 @@ done
 | шаг | команда | результат |
 |---|---|---|
 | валидация meta | `VLA_META_ROOT=<root> python3 validate_dataset.py` | hard-проверки → код возврата, soft → отчёт |
-| подготовка | `python3 prepare_data.py --root <root> --out data/cls` | `train/val/heldout.jsonl`, `meta.json`, `heldout.txt` |
+| подготовка | `python3 prepare_data.py --root <root> [--ann-root <gt>] --out data/cls` | `train/val/heldout.jsonl`, `meta.json`, `heldout.txt` |
 | zero-shot | `python3 evaluate.py --data data/cls/heldout.jsonl --group-by agent` | `data/cls/eval/heldout_base/` |
 | обучение | `DATA=data/cls bash train.sh` | `work_dirs/cls/`, `best_checkpoint.txt` по macro-F1 на val |
 | после обучения | `python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt)` | сравнение с majority-baseline |

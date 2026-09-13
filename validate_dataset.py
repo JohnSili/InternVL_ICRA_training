@@ -2,6 +2,7 @@
 """Валидатор датасета траекторий (pytest).
 
     VLA_META_ROOT=/data/trajectories python3 validate_dataset.py        # hard, потом soft
+    VLA_META_ROOT=~/Simpler/trajectories VLA_ANN_ROOT=~/Simpler/gt python3 validate_dataset.py  # проверять gt-разметку
     VLA_META_ROOT=... python3 validate_dataset.py --limit 20 --seed 1    # смоук на случайных 20
     VLA_META_ROOT=... VLA_META_LIMIT=20 VLA_META_SEED=1 pytest validate_dataset.py -m "not soft"
 
@@ -58,7 +59,26 @@ def is_labeled(meta):
     return isinstance(meta, dict) and meta.get("class_key") in CLASSES
 
 
-def load_dataset(root, limit=None, seed=0):
+def overlay_auto(meta, ann_root, agent, name):
+    """Заменяет метку в meta на gt-разметку из <ann_root>/<agent>/<name>_auto.json.
+
+    В _auto.json поля annotation лежат на верхнем уровне, поэтому он целиком кладётся в annotation:
+    дальше все проверки идут по нему, а кадры и actions остаются из meta. -> был ли оверлей."""
+    for p in (os.path.join(ann_root, agent, f"{name}_auto.json"), os.path.join(ann_root, f"{name}_auto.json")):
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    a = json.load(f)
+            except (OSError, ValueError):
+                return False
+            if isinstance(a, dict):
+                meta["class_key"] = a.get("class_key")
+                meta["annotation"] = a
+                return True
+    return False
+
+
+def load_dataset(root, limit=None, seed=0, ann_root=None):
     """Список записей: id, meta (или None + error), список индексов png. limit -> случайные limit штук.
 
     Неразмеченные эпизоды (json читается, но class_key не из A-E) в обучение не попадают, поэтому
@@ -70,12 +90,14 @@ def load_dataset(root, limit=None, seed=0):
                 continue
             name = fn[: -len("_meta.json")]
             rec = {"id": f"{agent}/{name}", "path": os.path.join(meta_dir, fn),
-                   "meta": None, "error": None, "png_idx": None}
+                   "meta": None, "error": None, "png_idx": None, "ann_source": "meta"}
             try:
                 with open(rec["path"]) as f:
                     rec["meta"] = json.load(f)
             except (OSError, ValueError) as e:
                 rec["error"] = str(e)
+            if ann_root and isinstance(rec["meta"], dict):
+                rec["ann_source"] = "auto" if overlay_auto(rec["meta"], ann_root, agent, name) else "missing"
             # json, который читается, но не размечен, пропускаем; не-dict остаётся и падает как битый
             if isinstance(rec["meta"], dict) and not is_labeled(rec["meta"]):
                 unlabeled.append(rec["id"])
@@ -109,12 +131,16 @@ def dataset(request):
     limit = request.config.getoption("--limit", None) or os.environ.get("VLA_META_LIMIT")
     seed = request.config.getoption("--seed", None)
     seed = int(os.environ.get("VLA_META_SEED", 0)) if seed is None else seed
-    recs, unlabeled = load_dataset(root, int(limit) if limit else None, seed)
+    ann_root = os.path.expanduser(os.environ["VLA_ANN_ROOT"]) if os.environ.get("VLA_ANN_ROOT") else None
+    if ann_root:
+        assert os.path.isdir(ann_root), f"VLA_ANN_ROOT не существует: {ann_root}"
+    recs, unlabeled = load_dataset(root, int(limit) if limit else None, seed, ann_root)
     assert recs, f"в {root} не найдено размеченных *_meta.json (неразмеченных: {len(unlabeled)})"
     by_agent = {}
     for r in recs:
         by_agent[r["id"].split("/")[0]] = by_agent.get(r["id"].split("/")[0], 0) + 1
-    print(f"\n[dataset] root={root} checked={len(recs)} {by_agent} unlabeled(skipped)={len(unlabeled)}"
+    src = f" ann_root={ann_root} (без gt-файла: {sum(1 for r in recs if r.get('ann_source') == 'missing')})" if ann_root else ""
+    print(f"\n[dataset] root={root} checked={len(recs)} {by_agent} unlabeled(skipped)={len(unlabeled)}{src}"
           + (f" (limit={limit} seed={seed})" if limit else ""))
     return recs
 

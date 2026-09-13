@@ -2,7 +2,12 @@
 """meta-json -> jsonl для InternVL (train / val / heldout + meta.json).
 
     python3 prepare_data.py --root /data/trajectories --out data/cls
+    python3 prepare_data.py --root ~/Simpler/trajectories --ann-root ~/Simpler/gt --out data/cls
     python3 prepare_data.py --root ... --out data/obs --target obs --balance --drop-recovery
+
+Кадры и actions всегда из --root (<агент>/{meta,frames}). Метки: без --ann-root из meta (ручная
+разметка), с --ann-root из <агент>/<имя>_auto.json для train и val, а held-out всегда по ручной —
+он эталон. Печатается согласие двух разметок: оно задаёт потолок метрики на held-out.
 
 Три набора: heldout (фиксированный список id в <out>/heldout.txt, создаётся один раз
 и потом только читается), val (отбор чекпоинта) и train. Все стратифицированы по классу.
@@ -66,7 +71,36 @@ def agent_dirs(root):
     return out
 
 
-def load_episodes(root):
+def as_label(class_key, ann, extra=None):
+    """Единый вид метки из любого источника. None, если класс не из A-E."""
+    if class_key not in set(CLASSES):  # set, а не строка: "" in "ABCDE" истинно, а None in "ABCDE" падает
+        return None
+    ann = ann or {}
+    lab = {"cls": class_key, "obs": ann.get("observation") or "none", "recovery": bool(ann.get("recovery"))}
+    if extra:
+        lab.update(extra)
+    return lab
+
+
+def read_auto(ann_root, agent, name):
+    """Метка из <ann_root>/<agent>/<name>_auto.json (или из плоского <ann_root>/<name>_auto.json).
+
+    В _auto.json поля annotation лежат на верхнем уровне рядом с class_key."""
+    for p in (os.path.join(ann_root, agent, f"{name}_auto.json"), os.path.join(ann_root, f"{name}_auto.json")):
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    a = json.load(f)
+            except (OSError, ValueError) as e:
+                print(f"bad auto-json {p}: {e}", file=sys.stderr)
+                return None
+            return as_label(a.get("class_key"), a, {"confidence": a.get("confidence"),
+                                                    "unresolved": bool(a.get("unresolved"))})
+    return None
+
+
+def load_episodes(root, ann_root=None):
+    """Кадры и actions всегда из <root>; метки из meta (ручные) и, если задан ann_root, из gt (auto)."""
     eps, skipped = [], Counter()
     for agent, meta_dir, frames_dir in agent_dirs(root):
         for fn in sorted(os.listdir(meta_dir)):
@@ -81,9 +115,8 @@ def load_episodes(root):
                 print(f"skip {eid}: {e}", file=sys.stderr)
                 skipped["bad_json"] += 1
                 continue
-            # set, а не строка: "" in "ABCDE" истинно, а None in "ABCDE" падает
-            if m.get("class_key") not in set(CLASSES) or not m.get("actions"):
-                skipped["unlabeled_or_no_actions"] += 1
+            if not m.get("actions"):
+                skipped["no_actions"] += 1
                 continue
             fd = os.path.join(frames_dir, f"{name}_frames")
             n_png = len([p for p in os.listdir(fd) if p.endswith(".png")]) if os.path.isdir(fd) else 0
@@ -91,18 +124,44 @@ def load_episodes(root):
                 skipped["no_frames"] += 1
                 continue
             g = [a[6] for a in m["actions"]]
-            ann = m.get("annotation") or {}
             eps.append({
-                "id": eid, "agent": agent, "cls": m["class_key"], "frames_dir": fd, "n_frames": n_png,
+                "id": eid, "agent": agent, "frames_dir": fd, "n_frames": n_png,
                 "instruction": m.get("instruction", ""),
                 # смены команды гриппера: [кадр, новое значение]; по actions, не по states
                 "flips": [[t, g[t]] for t in range(1, len(g)) if g[t] != g[t - 1]],
-                "obs": ann.get("observation") or "none",
-                "recovery": bool(ann.get("recovery")),
+                "manual": as_label(m.get("class_key"), m.get("annotation")),
+                "auto": read_auto(ann_root, agent, name) if ann_root else None,
             })
     if skipped:
         print(f"skipped: {dict(skipped)}", file=sys.stderr)
     return eps
+
+
+def labeled(eps, src):
+    """Эпизоды, у которых есть метка нужного источника, с полями cls/obs/recovery на верхнем уровне."""
+    return [dict(e, **e[src]) for e in eps if e[src]]
+
+
+def agreement_report(eps):
+    """Матрица ручной разметки против gt на эпизодах, где есть обе. Задаёт потолок метрики."""
+    both = [e for e in eps if e["manual"] and e["auto"]]
+    if not both:
+        print("\nпересечения ручной и gt разметки нет — сравнить нечем")
+        return
+    cm = Counter((e["manual"]["cls"], e["auto"]["cls"]) for e in both)
+    same = sum(n for (a, b), n in cm.items() if a == b)
+    print(f"\nсогласие разметок на {len(both)} эпизодах: {same}/{len(both)} = {same / len(both):.1%}"
+          f"  (потолок macro-F1 на ручном held-out, если учить по gt)")
+    print(f"{'manual/gt':>10s}" + "".join(f"{c:>6s}" for c in CLASSES))
+    for a in CLASSES:
+        row = [cm.get((a, b), 0) for b in CLASSES]
+        if sum(row):
+            print(f"{a:>10s}" + "".join(f"{v:6d}" for v in row))
+    bad = [(e["id"], e["manual"]["cls"], e["auto"]["cls"]) for e in both if e["manual"]["cls"] != e["auto"]["cls"]]
+    for i, a, b in bad[:10]:
+        print(f"  расходятся: {i} manual={a} gt={b}")
+    if len(bad) > 10:
+        print(f"  ... ещё {len(bad) - 10}")
 
 
 def _uniform(cands, k, rng, jitter):
@@ -196,7 +255,12 @@ def write_jsonl(path, records):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default="/data/trajectories")
+    ap.add_argument("--root", default="/data/trajectories", help="корень с <агент>/{meta,frames}")
+    ap.add_argument("--ann-root", default=None, metavar="DIR",
+                    help="корень с gt-разметкой <агент>/<имя>_auto.json: метки train и val берутся оттуда, "
+                         "held-out всегда по ручной разметке из meta")
+    ap.add_argument("--drop-unresolved", action="store_true",
+                    help="убрать из train и val эпизоды с unresolved=true в gt-разметке")
     ap.add_argument("--out", default="data/cls")
     ap.add_argument("--target", choices=("cls", "obs"), default="cls")
     ap.add_argument("--frame-selection", choices=FRAME_SELECTIONS, default="surr2")
@@ -210,11 +274,18 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    eps = load_episodes(args.root)
+    eps = load_episodes(args.root, args.ann_root)
     if not eps:
-        sys.exit(f"нет размеченных эпизодов в {args.root}")
-    print(f"episodes: {len(eps)}  classes: {dict(sorted(Counter(e['cls'] for e in eps).items()))}"
-          f"  agents: {dict(sorted(Counter(e['agent'] for e in eps).items()))}")
+        sys.exit(f"нет эпизодов с кадрами и actions в {args.root}")
+    train_src = "auto" if args.ann_root else "manual"
+    print(f"episodes: {len(eps)}  agents: {dict(sorted(Counter(e['agent'] for e in eps).items()))}")
+    for src in ("manual", "auto"):
+        lab = labeled(eps, src)
+        if lab or src == train_src:
+            print(f"  {src:6s} {len(lab):4d} размечено  {dict(sorted(Counter(e['cls'] for e in lab).items()))}")
+    if not labeled(eps, train_src):
+        sys.exit(f"нет эпизодов с разметкой {train_src}" + (f" в {args.ann_root}" if args.ann_root else ""))
+    print(f"метки: train/val <- {train_src}, held-out <- manual")
 
     # --- held-out: фиксированный список, создаётся один раз ---------------
     hold_path = args.holdout_list or os.path.join(args.out, "heldout.txt")
@@ -226,18 +297,27 @@ def main():
             print(f"warning: {len(unknown)} held-out id не найдены в данных: {sorted(unknown)[:5]}", file=sys.stderr)
         print(f"held-out list: {hold_path} ({len(hold_ids)} id)")
     else:
-        hold, _ = stratified_take(eps, args.holdout_frac, random.Random(args.seed))
+        # held-out нарезается только из размеченного вручную: это эталон
+        hold, _ = stratified_take(labeled(eps, "manual"), args.holdout_frac, random.Random(args.seed))
         hold_ids = {e["id"] for e in hold}
         with open(hold_path, "w") as f:
             f.write("\n".join(sorted(hold_ids)) + "\n")
         print(f"held-out list created: {hold_path} ({len(hold_ids)} id)")
-    heldout = [e for e in eps if e["id"] in hold_ids]
-    rest = [e for e in eps if e["id"] not in hold_ids]
+    heldout = [e for e in labeled(eps, "manual") if e["id"] in hold_ids]
+    missing = hold_ids - {e["id"] for e in heldout}
+    if missing:
+        print(f"warning: {len(missing)} held-out id без ручной разметки, выпали из held-out: "
+              f"{sorted(missing)[:5]}", file=sys.stderr)
+    rest = [e for e in labeled(eps, train_src) if e["id"] not in hold_ids]
 
     if args.drop_recovery:
         n0 = len(rest)
         rest = [e for e in rest if not e["recovery"]]
         print(f"drop-recovery: убрано {n0 - len(rest)} из train/val")
+    if args.drop_unresolved:
+        n0 = len(rest)
+        rest = [e for e in rest if not e.get("unresolved")]
+        print(f"drop-unresolved: убрано {n0 - len(rest)} из train/val")
 
     val, train = stratified_take(rest, args.val_frac, random.Random(args.seed + 1))
 
@@ -274,6 +354,11 @@ def main():
         print(f"{name:8s}" + "".join(f"{c.get(k, 0):6d}" for k in CLASSES) + f"{len(recs):8d}")
     if factor:
         print(f"balance factors: {factor}")
+    conf = Counter(e.get("confidence") for e in rest if e.get("confidence"))
+    if conf:
+        print(f"gt confidence в train/val: {dict(sorted(conf.items()))}")
+    if args.ann_root:
+        agreement_report(eps)
     print(f"\nframe selection: {fs}; written to {args.out}: train.jsonl val.jsonl heldout.jsonl meta.json")
 
 

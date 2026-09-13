@@ -134,6 +134,21 @@ done
 После шага 3 голый `uv sync` больше не запускать: он удалит deepspeed и flash-attn. Пересинхронизация только
 с `--extra train --extra flash`.
 
+### deepspeed и nvcc
+
+`train.sh` по умолчанию берёт `zero_stage1_torch_adam.json` из этого репозитория. Это копия конфига ZeRO-1 из
+InternVL плюс `"torch_adam": true`. Без этого флага deepspeed подменяет AdamW своим FusedAdam и компилирует его
+через `nvcc` на первом шаге обучения, то есть падает через минуту после старта, если toolkit неполный:
+
+```
+RuntimeError: Error building extension 'fused_adam'
+/bin/sh: 1: /usr/local/cuda-12.8/bin/nvcc: not found
+```
+
+`DS_CONFIG=` (пустое значение) запускает обучение вообще без deepspeed. На одной карте ZeRO-1 ничего не даёт:
+модель 2B с LoRA занимает 26 ГБ из 48, шардить нечего. Сам пакет deepspeed при этом всё равно нужен, его
+безусловно импортирует `internvl/dist_utils.py`.
+
 ### Отложенные варианты разбивки
 
 Не сделано намеренно, сделать при наличии времени после первого прогона. Held-out при обеих пересборках

@@ -37,6 +37,10 @@ LORA_R=${LORA_R:-16}
 SEED=${SEED:-0}
 MASTER_PORT=${MASTER_PORT:-34229}
 SELECT=${SELECT:-1}     # 0 — только обучение, без выбора лучшего чекпоинта по val
+# Конфиг deepspeed. По умолчанию наш, с "torch_adam": true: иначе deepspeed подставляет свой FusedAdam
+# и компилирует его через nvcc на первом шаге обучения, а toolkit нужен далеко не всегда.
+# DS_CONFIG= (пусто) — запустить вообще без deepspeed: на одной карте ZeRO-1 ничего не даёт.
+DS_CONFIG=${DS_CONFIG-$HERE/zero_stage1_torch_adam.json}
 WATCH_VAL=${WATCH_VAL:-1}   # 0 — не оценивать чекпоинты на val по ходу обучения
 TB_PORT=${TB_PORT:-6006}    # 0 — не поднимать tensorboard-сервер; TB_BIND_ALL=1 — слушать не только localhost
 # EXTRA_ARGS — дописываются в конец команды тренера (последнее вхождение флага побеждает),
@@ -108,6 +112,15 @@ if [ "$WATCH_VAL" = "1" ]; then
   echo "watch_val.sh запущен (pid $WATCH_PID), лог: $OUTPUT_DIR/watch_val.log"
 fi
 
+DS_ARGS=()
+if [ -n "$DS_CONFIG" ]; then
+  [ -f "$DS_CONFIG" ] || { echo "нет файла deepspeed-конфига: $DS_CONFIG"; exit 1; }
+  DS_ARGS=(--deepspeed "$(readlink -f "$DS_CONFIG")")
+  echo "deepspeed: $DS_CONFIG"
+else
+  echo "deepspeed отключён (DS_CONFIG пуст)"
+fi
+
 export PYTHONPATH="${PYTHONPATH:-}:$REPO"
 export TF_CPP_MIN_LOG_LEVEL=3
 export LAUNCHER=pytorch
@@ -158,7 +171,7 @@ torchrun \
   --dynamic_image_size True \
   --use_thumbnail True \
   --ps_version 'v2' \
-  --deepspeed "zero_stage1_config.json" \
+  ${DS_ARGS[@]+"${DS_ARGS[@]}"} \
   --report_to "tensorboard" \
   ${EXTRA_ARGS:-} \
   2>&1 | tee -a "${OUTPUT_DIR}/training_log.txt"

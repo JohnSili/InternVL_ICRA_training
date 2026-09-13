@@ -6,8 +6,9 @@
     python3 prepare_data.py --root ... --out data/obs --target obs --balance --drop-recovery
 
 Кадры и actions всегда из --root (<агент>/{meta,frames}). Метки: без --ann-root из meta (ручная
-разметка), с --ann-root из <агент>/<имя>_auto.json для train и val, а held-out всегда по ручной —
-он эталон. Печатается согласие двух разметок: оно задаёт потолок метрики на held-out.
+разметка), с --ann-root из <агент>/<имя>_auto.json; held-out берёт тот же источник, что train, а
+--holdout-src manual переключает его на ручную разметку. Печатается согласие двух разметок.
+--holdout-per-group N нарезает held-out по N эпизодов на каждую пару (агент, задача).
 
 Три набора: heldout (фиксированный список id в <out>/heldout.txt, создаётся один раз
 и потом только читается), val (отбор чекпоинта) и train. Все стратифицированы по классу.
@@ -21,6 +22,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -126,7 +128,8 @@ def load_episodes(root, ann_root=None):
                 continue
             g = [a[6] for a in m["actions"]]
             eps.append({
-                "id": eid, "agent": agent, "frames_dir": fd, "n_frames": n_png,
+                "id": eid, "agent": agent, "task": re.sub(r"_\d+$", "", name),
+                "frames_dir": fd, "n_frames": n_png,
                 "instruction": m.get("instruction", ""),
                 # смены команды гриппера: [кадр, новое значение]; по actions, не по states
                 "flips": [[t, g[t]] for t in range(1, len(g)) if g[t] != g[t - 1]],
@@ -248,6 +251,20 @@ def stratified_take(eps, frac, rng):
     return taken, rest
 
 
+def take_quota(items, n, rng):
+    """n эпизодов из группы с сохранением пропорций классов; добор и обрезка случайные."""
+    if n >= len(items):
+        return list(items)
+    taken, rest = stratified_take(items, n / len(items), rng)
+    if len(taken) > n:                       # stratified_take даёт минимум 1 на класс — может перебрать
+        rng.shuffle(taken)
+        taken = taken[:n]
+    elif len(taken) < n:
+        rng.shuffle(rest)
+        taken += rest[: n - len(taken)]
+    return taken
+
+
 def write_jsonl(path, records):
     with open(path, "w") as f:
         for r in records:
@@ -268,6 +285,12 @@ def main():
     ap.add_argument("--frame-selection", choices=FRAME_SELECTIONS, default="surr2")
     ap.add_argument("--holdout-list", default=None, help="файл с id held-out (по умолчанию <out>/heldout.txt)")
     ap.add_argument("--holdout-frac", type=float, default=0.25, help="доля на held-out, если список ещё не создан")
+    ap.add_argument("--holdout-per-group", type=int, default=None, metavar="N",
+                    help="вместо доли: ровно N эпизодов на каждую пару (агент, задача), "
+                         "пропорции классов внутри группы сохраняются")
+    ap.add_argument("--holdout-src", choices=("train", "manual", "auto"), default="train",
+                    help="источник меток held-out: train — тот же, что у train (по умолчанию), "
+                         "manual — ручная разметка из meta (эталон по ТЗ)")
     ap.add_argument("--val-frac", type=float, default=0.15, help="доля val от оставшегося после held-out")
     ap.add_argument("--balance", action="store_true", help="oversampling редких классов в train, потолок x5")
     ap.add_argument("--drop-recovery", action="store_true", help="убрать recovery=true из train и val")
@@ -294,7 +317,10 @@ def main():
             print(f"  {src:6s} {len(lab):4d} размечено  {dict(sorted(Counter(e['cls'] for e in lab).items()))}")
     if not labeled(eps, train_src):
         sys.exit(f"нет эпизодов с разметкой {train_src}" + (f" в {args.ann_root}" if args.ann_root else ""))
-    print(f"метки: train/val <- {train_src}, held-out <- manual")
+    hold_src = train_src if args.holdout_src == "train" else args.holdout_src
+    if not labeled(eps, hold_src):
+        sys.exit(f"нет эпизодов с разметкой {hold_src} для held-out")
+    print(f"метки: train/val <- {train_src}, held-out <- {hold_src}")
 
     # --- held-out: фиксированный список, создаётся один раз ---------------
     hold_path = args.holdout_list or os.path.join(args.out, "heldout.txt")
@@ -306,16 +332,28 @@ def main():
             print(f"warning: {len(unknown)} held-out id не найдены в данных: {sorted(unknown)[:5]}", file=sys.stderr)
         print(f"held-out list: {hold_path} ({len(hold_ids)} id)")
     else:
-        # held-out нарезается только из размеченного вручную: это эталон
-        hold, _ = stratified_take(labeled(eps, "manual"), args.holdout_frac, random.Random(args.seed))
+        pool = labeled(eps, hold_src)
+        rng = random.Random(args.seed)
+        if args.holdout_per_group:
+            groups = defaultdict(list)
+            for e in pool:
+                groups[(e["agent"], e["task"])].append(e)
+            hold = []
+            for g in sorted(groups):
+                got = take_quota(sorted(groups[g], key=lambda e: e["id"]), args.holdout_per_group, rng)
+                hold += got
+                if len(got) < args.holdout_per_group:
+                    print(f"warning: группа {g}: {len(got)} эпизодов вместо {args.holdout_per_group}", file=sys.stderr)
+        else:
+            hold, _ = stratified_take(pool, args.holdout_frac, rng)
         hold_ids = {e["id"] for e in hold}
         with open(hold_path, "w") as f:
             f.write("\n".join(sorted(hold_ids)) + "\n")
         print(f"held-out list created: {hold_path} ({len(hold_ids)} id)")
-    heldout = [e for e in labeled(eps, "manual") if e["id"] in hold_ids]
+    heldout = [e for e in labeled(eps, hold_src) if e["id"] in hold_ids]
     missing = hold_ids - {e["id"] for e in heldout}
     if missing:
-        print(f"warning: {len(missing)} held-out id без ручной разметки, выпали из held-out: "
+        print(f"warning: {len(missing)} held-out id без разметки {hold_src}, выпали из held-out: "
               f"{sorted(missing)[:5]}", file=sys.stderr)
     rest = [e for e in labeled(eps, train_src) if e["id"] not in hold_ids]
 
@@ -363,6 +401,9 @@ def main():
         print(f"{name:8s}" + "".join(f"{c.get(k, 0):6d}" for k in CLASSES) + f"{len(recs):8d}")
     if factor:
         print(f"balance factors: {factor}")
+    by_group = Counter((e["agent"], e["task"]) for e in heldout)
+    if len(by_group) > 1:
+        print("held-out по группам (агент, задача): " + ", ".join(f"{a}/{t}={n}" for (a, t), n in sorted(by_group.items())))
     conf = Counter(e.get("confidence") for e in rest if e.get("confidence"))
     if conf:
         print(f"gt confidence в train/val: {dict(sorted(conf.items()))}")

@@ -74,13 +74,20 @@ source .venv/bin/activate                                                       
 export VLA_META_ROOT=~/Simpler/trajectories VLA_ANN_ROOT=~/Simpler/gt
 python3 validate_dataset.py                                                        # проверяет gt-разметку
 VLA_ANN_ROOT= python3 validate_dataset.py                                          # то же по ручной разметке
-python3 prepare_data.py --root $VLA_META_ROOT --ann-root $VLA_ANN_ROOT --out data/cls --holdout-list data/cls/heldout.txt
+python3 prepare_data.py --out data/cls --holdout-list data/cls/heldout400.txt --holdout-per-group 50 --val-frac 0.03
 pytest test_pipeline.py -q -m "not gpu and not slow"                               # секунды
 pytest test_pipeline.py -q                                                         # с GPU-смоуком: два шага тренера, память, чекпоинт
 ```
 
-`--holdout-list data/cls/heldout.txt` обязателен: файл лежит в репозитории, и без него held-out нарежется заново.
-Без `--ann-root` метки для train и val берутся из ручной разметки, поведение прежнее.
+Held-out: `--holdout-per-group 50` берёт 50 эпизодов на каждую пару (агент, задача), то есть 400 при двух
+агентах и четырёх задачах, с сохранением пропорций классов внутри группы. Список пишется один раз в файл из
+`--holdout-list` и дальше только читается, поэтому его надо закоммитить: пересборка с тем же файлом даёт тот
+же held-out. Метки held-out по умолчанию из того же источника, что и train (gt); `--holdout-src manual`
+переключает на ручную разметку, если нужен эталонный замер по ТЗ.
+
+`--val-frac` задаёт val, который `watch_val.sh` прогоняет на каждом чекпоинте: при 7600 оставшихся эпизодах
+0.03 даёт около 230, а 0.15 дало бы 1100 и оценка одного чекпоинта заняла бы десятки минут.
+Без `--ann-root` (или `VLA_ANN_ROOT`) метки для train и val берутся из ручной разметки.
 
 `prepare_data.py` напечатает согласие двух разметок на пересечении и первые расхождения. Это число — потолок:
 если gt и ручная совпадают, скажем, на 85%, то macro-F1 выше 0.85 на ручном held-out ждать не стоит, как бы
@@ -115,7 +122,7 @@ python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/bes
 
 ```bash
 PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACC=16 DATA=data/cls bash train.sh          # если OOM
-python3 prepare_data.py --root $VLA_META_ROOT --ann-root $VLA_ANN_ROOT --out data/obs --target obs --balance --drop-recovery --holdout-list data/cls/heldout.txt
+python3 prepare_data.py --out data/obs --target obs --balance --drop-recovery --holdout-list data/cls/heldout400.txt
 DATA=data/obs bash train.sh                                                  # ответ <класс>|<симптом>, oversampling редких классов
 for fs in surr2 uniform dense_sparse; do                                     # ablation по стратегии отбора кадров
   python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --frame-selection $fs

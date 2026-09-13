@@ -1,0 +1,48 @@
+[project]
+name = "vlmfinetuning"
+version = "0.1.0"
+description = "InternVL3-2B LoRA fine-tuning for robot-manipulation error classification"
+requires-python = ">=3.10,<3.13"
+# Одно окружение на подготовку данных, оценку, тесты и обучение. Версии transformers/peft/accelerate/
+# numpy/tokenizers взяты из InternVL/requirements/internvl_chat.txt: тренер InternVL написан под них
+# (transformers >= 4.46 уже не принимает --evaluation_strategy, который использует его эталонный скрипт).
+dependencies = [
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "transformers==4.37.2",
+    "tokenizers==0.15.1",
+    "peft==0.10.0",
+    "accelerate<1",
+    "numpy<2",
+    "timm>=0.9.12",
+    "einops>=0.6.1",
+    "safetensors>=0.4",
+    "sentencepiece>=0.1.99",
+    "huggingface-hub>=0.23,<1",
+    "pillow>=10",
+    "eva-decord>=0.6.1",    # модуль decord: internvl.train.dataset импортирует его безусловно; у оригинального decord кривые теги wheel, uv переустанавливал его каждый запуск
+    "opencv-python>=4.8",
+    "imageio>=2.31",
+    "datasets>=2.16",       # internvl.patch импортирует безусловно
+    "orjson>=3.9",
+    "tensorboard>=2.15",
+    "pytest>=8",
+]
+
+[project.optional-dependencies]
+# Ставятся вторым шагом, когда torch уже в .venv (их setup.py импортирует torch):
+#   uv sync && uv sync --extra train --extra flash
+train = ["deepspeed>=0.14"]
+flash = ["flash-attn>=2.5"]   # нужен nvcc; тренер InternVL включает flash_attention_2 безусловно
+
+[tool.uv]
+package = false
+no-build-isolation-package = ["deepspeed", "flash-attn"]
+
+# flash-attn не даёт статических метаданных, а его setup.py требует torch и nvcc уже на этапе
+# резолва; объявляем зависимости вручную, чтобы uv lock не пытался его собирать.
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.8.3"
+requires-dist = ["torch", "einops"]
+requires-python = ">=3.9"

@@ -1,0 +1,25 @@
+Frame 1: <image>
+Frame 2: <image>
+Frame 3: <image>
+Frame 4: <image>
+Frame 5: <image>
+Frame 6: <image>
+Frame 7: <image>
+Frame 8: <image>
+Frame 9: <image>
+Frame 10: <image>
+Frame 11: <image>
+Frame 12: <image>
+Frame 13: <image>
+Frame 14: <image>
+Frame 15: <image>
+Frame 16: <image>
+These are 16 frames, in chronological order, from a video of a robot arm executing the task: "{instruction}".
+Classify the outcome of the episode into exactly one category:
+A - Target Position Error: the gripper never reaches the object; the object is not touched during the whole episode.
+B - Grasping Error: the gripper reaches or touches the object, but never holds it (the object never moves together with the gripper).
+C - Trajectory Error: the arm collides with an unrelated object or gets stuck (commands are issued but the arm does not move).
+D - Transfer Error: the object is grasped and lifted, but then dropped, released outside the target, or never released.
+E - Success: the object is carried and placed inside the target zone.
+If several events occur, the class is determined by the earliest one. Holding is checked first: if the object ever moved in the gripper, A and B are excluded.
+Answer with a single letter (A, B, C, D or E).

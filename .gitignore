@@ -1,0 +1,20 @@
+# окружение и кэши
+.venv/
+__pycache__/
+.pytest_cache/
+
+# тренировочный код InternVL клонируется на месте (README), не хранится в репо
+InternVL/
+
+# сырой датасет (1.7 ГБ png) переносится rsync/scp, не через git
+INTACT-pi0-scratch-bridge/
+
+# артефакты prepare_data.py содержат абсолютные пути этой машины: пересобираются на сервере.
+# heldout.txt — список id эталонных траекторий, он должен быть в репо, иначе held-out поплывёт.
+data/*
+!data/cls/
+data/cls/*
+!data/cls/heldout.txt
+
+# результаты обучения и оценок
+work_dirs/

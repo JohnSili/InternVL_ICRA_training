@@ -70,6 +70,7 @@ source .venv/bin/activate
 **4. Данные и предполётные проверки:**
 
 ```bash
+source .venv/bin/activate                                                          # в каждой новой ssh-сессии
 export VLA_META_ROOT=~/Simpler/trajectories VLA_ANN_ROOT=~/Simpler/gt
 python3 validate_dataset.py                                                        # проверяет gt-разметку
 VLA_ANN_ROOT= python3 validate_dataset.py                                          # то же по ручной разметке

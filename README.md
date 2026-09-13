@@ -12,10 +12,11 @@ uv sync --extra train --extra flash       # на машине с GPU и nvcc: de
 git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout -q 2410d1dbf208f0e799459aff9376e5747dbf41a2   # тренировочный код: не ставится, train.sh берёт его через PYTHONPATH; коммит тот, на котором всё проверено
 ```
 
-Второй `uv sync` отдельным шагом не случайно: `setup.py` у deepspeed и flash-attn импортируют torch, поэтому
-они собираются без изоляции уже поверх `.venv` с torch. Обоим нужен CUDA toolkit (`nvcc`, `CUDA_HOME`), без него
-сборка падает; flash-attn компилируется из исходников десятки минут (`MAX_JOBS=8` ускоряет). Python берётся из
-`.python-version` (3.12), uv скачает его сам.
+Второй `uv sync` отдельным шагом не случайно: `setup.py` у deepspeed импортирует torch, поэтому он собирается
+без изоляции уже поверх `.venv` с torch, и ему нужен `CUDA_HOME` из шага 2. flash-attn ставится готовым колесом
+под cp312/x86_64/torch2.9/cu12 прямо с GitHub, ничего не компилирует. Ровно поэтому torch зафиксирован на 2.9.1:
+под более свежие версии готовых колёс flash-attn нет, а тренер InternVL импортирует его безусловно.
+Python берётся из `.python-version` (3.12), uv скачает его сам.
 
 `uv sync` синхронизирует окружение точно: голый `uv sync` после установки экстр удалит deepspeed и flash-attn,
 поэтому на тренировочной машине всегда добавляйте `--extra train --extra flash`. Запуск скриптов:
@@ -42,18 +43,19 @@ git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout 
 rsync -a --info=progress2 ~/Documents/vlmfinetuning/INTACT-pi0-scratch-bridge/ <user>@<host>:~/Simpler/trajectories/INTACT-pi0-scratch-bridge/
 ```
 
-**2. CUDA toolkit** (на сервере, если `which nvcc` пуст). flash-attn и deepspeed компилируют CUDA-расширения,
-драйвера и `nvidia-smi` для этого мало. Мажорная версия toolkit должна совпадать с CUDA у torch из `uv.lock`
-(`2.14.0+cu130` → 13.x). Ставить только `cuda-toolkit-*`, не метапакет `cuda`: тот тянет драйвер и в контейнере
+**2. CUDA toolkit 12.8** (на сервере, если `which nvcc` пуст). `deepspeed` требует `CUDA_HOME` даже когда
+ничего не собирает, поэтому драйвера и `nvidia-smi` мало. Версия должна совпадать с CUDA у torch из `uv.lock`
+(`2.9.1+cu128` → 12.8), не с версией драйвера: драйвер 580 показывает «CUDA 13.0», но прекрасно исполняет
+бинарники CUDA 12. Ставить только `cuda-toolkit-*`, не метапакет `cuda`: тот тянет драйвер и в контейнере
 ломает GPU.
 
 ```bash
 . /etc/os-release && echo "ubuntu${VERSION_ID/./}"          # ubuntu2204 / ubuntu2404 → подставить в URL ниже
 apt-get update && apt-get install -y wget
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update && apt-get install -y cuda-toolkit-13-0
-export CUDA_HOME=/usr/local/cuda-13.0 && export PATH=$CUDA_HOME/bin:$PATH   # нужны и при обучении: deepspeed собирает ops JIT
-nvcc --version | tail -1
+dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update && apt-get install -y cuda-toolkit-12-8
+export CUDA_HOME=/usr/local/cuda-12.8 && export PATH=$CUDA_HOME/bin:$PATH   # нужны и при обучении: deepspeed собирает ops JIT
+nvcc --version | tail -1                                     # должно быть release 12.8
 ```
 
 **3. Код и окружение** (на сервере):
@@ -61,7 +63,7 @@ nvcc --version | tail -1
 ```bash
 git clone git@github.com:JohnSili/InternVL_ICRA_training.git vlmfinetuning && cd vlmfinetuning
 uv sync                                    # torch, transformers 4.37.2, peft, tensorboard, pytest
-MAX_JOBS=8 uv sync --extra train --extra flash   # deepspeed + flash-attn, компиляция flash-attn занимает десятки минут
+uv sync --extra train --extra flash         # flash-attn ставится готовым колесом, компиляции нет
 .venv/bin/python -c "import deepspeed, flash_attn, torch; print(deepspeed.__version__, flash_attn.__version__, torch.version.cuda)"
 git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout -q 2410d1dbf208f0e799459aff9376e5747dbf41a2
 source .venv/bin/activate

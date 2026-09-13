@@ -7,8 +7,11 @@ requires-python = ">=3.10,<3.13"
 # numpy/tokenizers взяты из InternVL/requirements/internvl_chat.txt: тренер InternVL написан под них
 # (transformers >= 4.46 уже не принимает --evaluation_strategy, который использует его эталонный скрипт).
 dependencies = [
-    "torch>=2.4",
-    "torchvision>=0.19",
+    # torch 2.9 + CUDA 12.8, а не самый свежий: только под эту пару есть готовое колесо flash-attn
+    # (Dao-AILab собирает до torch 2.10, под CUDA 13 — только aarch64), а собирать его из исходников
+    # это час компиляции и неизвестный исход на новых torch/CUDA.
+    "torch==2.9.1",
+    "torchvision==0.24.1",
     "transformers==4.37.2",
     "tokenizers==0.15.1",
     "peft==0.10.0",
@@ -32,17 +35,11 @@ dependencies = [
 [project.optional-dependencies]
 # Ставятся вторым шагом, когда torch уже в .venv (их setup.py импортирует torch):
 #   uv sync && uv sync --extra train --extra flash
-train = ["deepspeed>=0.14"]
-flash = ["flash-attn>=2.5"]   # нужен nvcc; тренер InternVL включает flash_attention_2 безусловно
+train = ["deepspeed>=0.14"]      # нужен nvcc: setup.py требует CUDA_HOME даже без сборки ops
+# Готовое колесо под cp312/x86_64/torch2.9/cu12: ставится за секунды, ничего не компилирует.
+# Тренер InternVL импортирует flash_attn безусловно, без него не стартует.
+flash = ["flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"]
 
 [tool.uv]
 package = false
-no-build-isolation-package = ["deepspeed", "flash-attn"]
-
-# flash-attn не даёт статических метаданных, а его setup.py требует torch и nvcc уже на этапе
-# резолва; объявляем зависимости вручную, чтобы uv lock не пытался его собирать.
-[[tool.uv.dependency-metadata]]
-name = "flash-attn"
-version = "2.8.3"
-requires-dist = ["torch", "einops"]
-requires-python = ">=3.9"
+no-build-isolation-package = ["deepspeed"]

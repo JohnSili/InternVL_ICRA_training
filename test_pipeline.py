@@ -108,16 +108,18 @@ def data():
     d["train"] = d["splits"]["train"]
     d["val"] = d["splits"].get("val", [])
     d["all"] = [(s, r) for s, recs in d["splits"].items() for r in recs]
-    hold_txt = os.path.join(DATA_OUT, "heldout.txt")
-    if os.path.exists(hold_txt):
-        with open(hold_txt) as f:
-            d["heldout_ids"] = {l.strip() for l in f if l.strip()}
-    elif "heldout" in d["splits"]:
-        d["heldout_ids"] = {r.get("id") for r in d["splits"]["heldout"]}
-    else:
-        d["heldout_ids"] = None
     cfg_path = os.path.join(DATA_OUT, "prepare_config.json")
     d["prepare_config"] = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+    # именно тот список, которым резали: рядом может лежать устаревший heldout.txt от прошлой разбивки
+    cand = [c for c in (d["prepare_config"].get("holdout_list"), os.path.join(DATA_OUT, "heldout.txt")) if c]
+    cand += [os.path.join(HERE, c) for c in cand if not os.path.isabs(c)]
+    hold_txt = next((c for c in cand if os.path.exists(c)), None)
+    ids = {r.get("id") for r in d["splits"].get("heldout", [])}
+    if hold_txt:
+        with open(hold_txt) as f:
+            ids |= {l.strip() for l in f if l.strip()}
+    d["heldout_ids"] = ids or None
+    d["heldout_list"] = hold_txt
     d["target"] = d["prepare_config"].get("target") or (
         "obs" if any("|" in str(answer(r)) for r in d["train"] if isinstance(r.get("conversations"), list)
                      and len(r["conversations"]) == 2) else "cls")
@@ -395,9 +397,10 @@ def test_no_leakage_train_val(data):
     report("id есть и в train, и в val", [(i, "train ∩ val") for i in sorted(inter)], len(data["train"]))
 
 
-def test_no_leakage_heldout(data):
+def test_no_leakage_heldout(data, request):
     if data["heldout_ids"] is None:
-        pytest.skip(f"нет {DATA_OUT}/heldout.txt и heldout.jsonl — held-out набор не задан")
+        pytest.skip(f"нет списка held-out и heldout.jsonl в {DATA_OUT}")
+    say(request, f"held-out: {len(data['heldout_ids'])} id из {data['heldout_list'] or 'heldout.jsonl'}")
     train_ids = {r["id"] for s, r in ok_recs(data) if s == "train"}
     val_ids = {r["id"] for s, r in ok_recs(data) if s == "val"}
     bad = [(i, "held-out ∩ train") for i in sorted(data["heldout_ids"] & train_ids)]

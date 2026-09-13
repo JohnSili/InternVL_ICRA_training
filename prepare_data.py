@@ -81,8 +81,9 @@ def load_episodes(root):
                 print(f"skip {eid}: {e}", file=sys.stderr)
                 skipped["bad_json"] += 1
                 continue
-            if m.get("class_key") not in CLASSES or not m.get("actions"):
-                skipped["no_label_or_actions"] += 1
+            # set, а не строка: "" in "ABCDE" истинно, а None in "ABCDE" падает
+            if m.get("class_key") not in set(CLASSES) or not m.get("actions"):
+                skipped["unlabeled_or_no_actions"] += 1
                 continue
             fd = os.path.join(frames_dir, f"{name}_frames")
             n_png = len([p for p in os.listdir(fd) if p.endswith(".png")]) if os.path.isdir(fd) else 0

@@ -28,29 +28,46 @@ git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout 
 
 ## Запуск на сервере: полный набор команд
 
-Пути `/data/trajectories`, `<user>@<host>` замените на свои. Команды идут по порядку, каждый следующий шаг
-предполагает, что предыдущий отработал.
+Команды идут по порядку, каждый следующий шаг предполагает, что предыдущий отработал. Корень данных на
+сервере: `~/Simpler/trajectories` (внутри папки агентов `INTACT-pi0-scratch-bridge`, `openvla-7b`, у каждого
+`meta/` и `frames/`); соседняя `~/Simpler/gt` к пайплайну не относится. Неразмеченные эпизоды (без `class_key`
+из A–E) валидатор и `prepare_data.py` считают и пропускают, в обучение они не попадают.
 
-**1. Данные на сервер** (с рабочей машины, один раз; png не хранятся в git):
+**1. Данные на сервер** — только если их там ещё нет (png не хранятся в git):
 
 ```bash
-rsync -a --info=progress2 ~/Documents/vlmfinetuning/INTACT-pi0-scratch-bridge/ <user>@<host>:/data/trajectories/INTACT-pi0-scratch-bridge/
+rsync -a --info=progress2 ~/Documents/vlmfinetuning/INTACT-pi0-scratch-bridge/ <user>@<host>:~/Simpler/trajectories/INTACT-pi0-scratch-bridge/
 ```
 
-**2. Код и окружение** (на сервере):
+**2. CUDA toolkit** (на сервере, если `which nvcc` пуст). flash-attn и deepspeed компилируют CUDA-расширения,
+драйвера и `nvidia-smi` для этого мало. Мажорная версия toolkit должна совпадать с CUDA у torch из `uv.lock`
+(`2.14.0+cu130` → 13.x). Ставить только `cuda-toolkit-*`, не метапакет `cuda`: тот тянет драйвер и в контейнере
+ломает GPU.
+
+```bash
+. /etc/os-release && echo "ubuntu${VERSION_ID/./}"          # ubuntu2204 / ubuntu2404 → подставить в URL ниже
+apt-get update && apt-get install -y wget
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update && apt-get install -y cuda-toolkit-13-0
+export CUDA_HOME=/usr/local/cuda-13.0 && export PATH=$CUDA_HOME/bin:$PATH   # нужны и при обучении: deepspeed собирает ops JIT
+nvcc --version | tail -1
+```
+
+**3. Код и окружение** (на сервере):
 
 ```bash
 git clone git@github.com:JohnSili/InternVL_ICRA_training.git vlmfinetuning && cd vlmfinetuning
 uv sync                                    # torch, transformers 4.37.2, peft, tensorboard, pytest
-uv sync --extra train --extra flash        # deepspeed + flash-attn, компилируются, нужен nvcc; MAX_JOBS=8 ускорит
+MAX_JOBS=8 uv sync --extra train --extra flash   # deepspeed + flash-attn, компиляция flash-attn занимает десятки минут
+.venv/bin/python -c "import deepspeed, flash_attn, torch; print(deepspeed.__version__, flash_attn.__version__, torch.version.cuda)"
 git clone https://github.com/OpenGVLab/InternVL.git && git -C InternVL checkout -q 2410d1dbf208f0e799459aff9376e5747dbf41a2
 source .venv/bin/activate
 ```
 
-**3. Данные и предполётные проверки:**
+**4. Данные и предполётные проверки:**
 
 ```bash
-export VLA_META_ROOT=/data/trajectories
+export VLA_META_ROOT=~/Simpler/trajectories
 python3 validate_dataset.py                                                        # hard-проверки должны быть зелёные
 python3 prepare_data.py --root $VLA_META_ROOT --out data/cls --holdout-list data/cls/heldout.txt
 pytest test_pipeline.py -q -m "not gpu and not slow"                               # секунды
@@ -59,14 +76,14 @@ pytest test_pipeline.py -q                                                      
 
 `--holdout-list data/cls/heldout.txt` обязателен: файл лежит в репозитории, и без него held-out нарежется заново.
 
-**4. Точка отсчёта до обучения** (zero-shot, должен совпасть с majority):
+**5. Точка отсчёта до обучения** (zero-shot, должен совпасть с majority):
 
 ```bash
 python3 evaluate.py --data data/cls/heldout.jsonl --group-by agent
 python3 evaluate.py --data data/cls/val.jsonl
 ```
 
-**5. Обучение** (под `tmux` или `nohup`, чтобы пережило обрыв ssh):
+**6. Обучение** (под `tmux` или `nohup`, чтобы пережило обрыв ssh):
 
 ```bash
 DATA=data/cls bash train.sh 2>&1 | tee train_cls.log
@@ -75,7 +92,7 @@ DATA=data/cls bash train.sh 2>&1 | tee train_cls.log
 Сам поднимет TensorBoard на 6006 и наблюдатель по val, в конце запишет `work_dirs/cls/best_checkpoint.txt`.
 С рабочей машины: `ssh -L 6006:localhost:6006 <user>@<host>`, затем http://localhost:6006.
 
-**6. Итоговая оценка на held-out:**
+**7. Итоговая оценка на held-out:**
 
 ```bash
 python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --group-by agent --tensorboard work_dirs/cls/tensorboard
@@ -94,7 +111,7 @@ for fs in surr2 uniform dense_sparse; do                                     # a
 done
 ```
 
-После шага 2 голый `uv sync` больше не запускать: он удалит deepspeed и flash-attn. Пересинхронизация только
+После шага 3 голый `uv sync` больше не запускать: он удалит deepspeed и flash-attn. Пересинхронизация только
 с `--extra train --extra flash`.
 
 ## Скрипты

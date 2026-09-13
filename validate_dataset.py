@@ -54,9 +54,16 @@ def agent_dirs(root):
     return out
 
 
+def is_labeled(meta):
+    return isinstance(meta, dict) and meta.get("class_key") in CLASSES
+
+
 def load_dataset(root, limit=None, seed=0):
-    """Список записей: id, meta (или None + error), список индексов png. limit -> случайные limit штук."""
-    recs = []
+    """Список записей: id, meta (или None + error), список индексов png. limit -> случайные limit штук.
+
+    Неразмеченные эпизоды (json читается, но class_key не из A-E) в обучение не попадают, поэтому
+    возвращаются отдельно вторым элементом и только считаются; битые json остаются в основном списке."""
+    recs, unlabeled = [], []
     for agent, meta_dir, frames_dir in agent_dirs(root):
         for fn in sorted(os.listdir(meta_dir)):
             if not fn.endswith("_meta.json"):
@@ -69,6 +76,10 @@ def load_dataset(root, limit=None, seed=0):
                     rec["meta"] = json.load(f)
             except (OSError, ValueError) as e:
                 rec["error"] = str(e)
+            # json, который читается, но не размечен, пропускаем; не-dict остаётся и падает как битый
+            if isinstance(rec["meta"], dict) and not is_labeled(rec["meta"]):
+                unlabeled.append(rec["id"])
+                continue
             fd = os.path.join(frames_dir, f"{name}_frames")
             if os.path.isdir(fd):
                 idx = []
@@ -82,7 +93,7 @@ def load_dataset(root, limit=None, seed=0):
     if limit and limit < len(recs):
         random.Random(seed).shuffle(recs)
         recs = sorted(recs[:limit], key=lambda r: r["id"])
-    return recs
+    return recs, unlabeled
 
 
 def pytest_addoption(parser):
@@ -98,9 +109,13 @@ def dataset(request):
     limit = request.config.getoption("--limit", None) or os.environ.get("VLA_META_LIMIT")
     seed = request.config.getoption("--seed", None)
     seed = int(os.environ.get("VLA_META_SEED", 0)) if seed is None else seed
-    recs = load_dataset(root, int(limit) if limit else None, seed)
-    assert recs, f"в {root} не найдено *_meta.json"
-    print(f"\n[dataset] root={root} episodes={len(recs)}" + (f" (limit={limit} seed={seed})" if limit else ""))
+    recs, unlabeled = load_dataset(root, int(limit) if limit else None, seed)
+    assert recs, f"в {root} не найдено размеченных *_meta.json (неразмеченных: {len(unlabeled)})"
+    by_agent = {}
+    for r in recs:
+        by_agent[r["id"].split("/")[0]] = by_agent.get(r["id"].split("/")[0], 0) + 1
+    print(f"\n[dataset] root={root} checked={len(recs)} {by_agent} unlabeled(skipped)={len(unlabeled)}"
+          + (f" (limit={limit} seed={seed})" if limit else ""))
     return recs
 
 

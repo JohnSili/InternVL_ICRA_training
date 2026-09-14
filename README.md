@@ -257,6 +257,17 @@ python3 evaluate.py --data data/paper/heldout.jsonl --frame-selection $FS --max-
 статистики DivPrune пишутся `kept_per_frame`, для Top-K — `frame_scores` пула и `topk_frames`; в `metrics.json`
 среднее число кадров и визуальных токенов на эпизод.
 
+**Шаги 4–5 одной очередью** (во втором окне `tmux`, можно запускать сразу вместе с обучением):
+
+```bash
+bash paper_evals.sh 2>&1 | tee paper_evals.log                     # zero-shot 2B и дообученная модель
+MODELS=base MODEL=OpenGVLab/InternVL3-8B bash paper_evals.sh       # zero-shot 8B, когда модель скачана
+```
+
+Скрипт ждёт конца обучения и свежего `best_checkpoint.txt` и до этого карту не занимает. Готовые прогоны
+(есть `metrics.json`) пропускает, поэтому после падения его просто запускают ещё раз. В конце печатает сводку
+по всем `data/paper/eval/heldout*`. Стратегия пула Top-K берётся из `data/paper/prepare_config.json`.
+
 ## Скрипты
 
 Четыре скрипта, общаются через файлы:

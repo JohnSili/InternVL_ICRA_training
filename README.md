@@ -264,7 +264,9 @@ bash paper_evals.sh 2>&1 | tee paper_evals.log                     # zero-shot 2
 MODELS=base MODEL=OpenGVLab/InternVL3-8B bash paper_evals.sh       # zero-shot 8B, когда модель скачана
 ```
 
-Скрипт ждёт конца обучения и свежего `best_checkpoint.txt` и до этого карту не занимает. Готовые прогоны
+На каждую модель в очереди: test и человеческий тест на полных токенах, две другие стратегии кадров на test,
+DivPrune 0.2/0.5/0.7 со случайным контролем, Top-K. Скрипт ждёт конца обучения и свежего `best_checkpoint.txt`
+и до этого карту не занимает. Готовые прогоны
 (есть `metrics.json`) пропускает, поэтому после падения его просто запускают ещё раз. В конце печатает сводку
 по всем `data/paper/eval/heldout*`. Стратегия пула Top-K берётся из `data/paper/prepare_config.json`.
 

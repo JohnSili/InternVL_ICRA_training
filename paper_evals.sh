@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Очередь оценок для статьи на test: zero-shot и дообученная модель из train.sh.
-# На каждую модель: полные токены на heldout и heldout_human, DivPrune с долями RATIOS и случайный
+# На каждую модель: полные токены на heldout и heldout_human, две другие стратегии кадров авторов на heldout,
+# DivPrune с долями RATIOS и случайный
 # контроль с теми же долями, Top-K из пула POOL кадров (k <= TOPK). Прогон, у которого уже есть
 # metrics.json, пропускается, поэтому после падения скрипт просто запускают ещё раз.
 # Дообученная модель берётся из RUN/best_checkpoint.txt. Если обучение ещё идёт, скрипт ждёт его конца
@@ -96,6 +97,10 @@ for m in $MODELS; do
   if [ -f "$DATA/heldout_human.jsonl" ]; then
     run "$E/heldout_human_$tag$sfx" --data "$DATA/heldout_human.jsonl" $margs
   fi
+  for s in uniform dense_sparse surrounding; do  # таблица стратегий кадров; стратегия данных уже посчитана выше
+    [ "$s" = "$FS" ] && continue
+    run "$E/heldout_${tag}_$s$sfx" --data "$DATA/heldout.jsonl" --frame-selection "$s" $margs
+  done
   for r in $RATIOS; do
     run "$E/heldout_${tag}_tok$r$sfx" --data "$DATA/heldout.jsonl" --token-ratio "$r" $margs
     run "$E/heldout_${tag}_rand$r$sfx" --data "$DATA/heldout.jsonl" --token-ratio "$r" --token-random $margs

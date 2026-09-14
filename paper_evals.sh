@@ -63,6 +63,19 @@ run() {  # run <out_dir> <аргументы evaluate.py>
     || failed+=("$out")
 }
 
+# ждём до любых прогонов: zero-shot во время обучения делил бы карту с тренером.
+# Если обучение упало, zero-shot всё равно считается, а дообученная модель пропускается.
+ck=""
+case " $MODELS " in
+  *" ft "*)
+    if wait_best; then
+      ck=$(cat "$RUN/best_checkpoint.txt")
+      echo "дообученная модель: $ck"
+    else
+      failed+=("ft: нет отобранного чекпоинта")
+    fi ;;
+esac
+
 sfx=${LIMIT:+_limit$LIMIT}
 E="$DATA/eval"
 for m in $MODELS; do
@@ -71,11 +84,9 @@ for m in $MODELS; do
       model_args=()
       if [ "$MODEL" = "$DEFAULT_MODEL" ]; then tag=base; else tag="base-$(basename "$MODEL")"; fi ;;
     ft)
-      if ! wait_best; then failed+=("ft: нет отобранного чекпоинта"); continue; fi
-      ck=$(cat "$RUN/best_checkpoint.txt")
+      [ -n "$ck" ] || continue
       model_args=(--lora "$ck")
-      tag=$(basename "$ck")
-      echo "дообученная модель: $ck" ;;
+      tag=$(basename "$ck") ;;
     *)
       echo "MODELS: base и/или ft, а не $m"
       exit 1 ;;

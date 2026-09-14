@@ -236,6 +236,22 @@ python3 evaluate.py --data data/paper/heldout.jsonl --model OpenGVLab/InternVL3-
 InternVL3-8B занимает около 16 ГБ в кэше HF. Скачивать его после обучения, без прокси и без offline-режима:
 `env -u http_proxy -u https_proxy -u all_proxy HF_HUB_DISABLE_XET=1 HF_HUB_OFFLINE=0 huggingface-cli download OpenGVLab/InternVL3-8B`.
 
+**5. Абляции токенов и Top-K** (на test; `FS` — стратегия, выбранная на шаге 2):
+
+```bash
+for r in 0.2 0.5 0.7; do
+  python3 evaluate.py --data data/paper/heldout.jsonl --token-ratio $r                  # DivPrune по всему клипу
+  python3 evaluate.py --data data/paper/heldout.jsonl --token-ratio $r --token-random   # контроль: случайные токены
+done
+python3 evaluate.py --data data/paper/heldout.jsonl --frame-selection $FS --max-frames 30 --topk 20   # пул 30, k <= 20
+```
+
+Для дообученной модели те же команды с `--lora $B`, для 8B — с `--model OpenGVLab/InternVL3-8B`. Доля 1.0 —
+обычный прогон без флагов: при `--token-ratio 1.0` вероятности совпадают с ним до последнего знака. Папки
+результатов получают суффиксы `_tok0.2`, `_rand0.2`, `_<FS>_mf30_topk20`. В `predictions.jsonl` для
+статистики DivPrune пишутся `kept_per_frame`, для Top-K — `frame_scores` пула и `topk_frames`; в `metrics.json`
+среднее число кадров и визуальных токенов на эпизод.
+
 ## Скрипты
 
 Четыре скрипта, общаются через файлы:

@@ -5,6 +5,9 @@
     python3 evaluate.py --data data/cls/heldout.jsonl --lora work_dirs/cls/checkpoint-12
     python3 evaluate.py --data ... --frame-selection uniform --group-by agent  # ablation по кадрам
     python3 evaluate.py --from-predictions data/cls/eval/heldout_base/predictions.jsonl --group-by agent
+    python3 evaluate.py --data data/paper/heldout.jsonl --token-ratio 0.2                 # DivPrune, 20% токенов
+    python3 evaluate.py --data data/paper/heldout.jsonl --token-ratio 0.2 --token-random  # контроль: случайные
+    python3 evaluate.py --data data/paper/heldout.jsonl --frame-selection dense_sparse --max-frames 30 --topk 20
 
 Промпт берётся из jsonl как есть и оборачивается в шаблон internvl2_5 ровно так же,
 как это делает preprocess_internvl2_5 при обучении. Класс = буква с максимальным logit
@@ -23,10 +26,11 @@ import re
 import subprocess
 import sys
 import time
+import zlib
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prepare_data import FRAME_SELECTIONS, MAX_FRAMES, N_FRAMES, PAPER_IMAGE, pick_frames  # noqa: E402
+from prepare_data import FRAME_SELECTIONS, MAX_FRAMES, PAPER_IMAGE, pick_frames  # noqa: E402
 import fsr  # noqa: E402
 
 CLASSES = "ABCDE"
@@ -112,54 +116,96 @@ def use_sdpa(model):
         print(f"[sdpa] не включилось, остаётся eager: {type(e).__name__}: {e}", file=sys.stderr)
 
 
-def build_query(model, human_value):
-    img = "<img>" + "<IMG_CONTEXT>" * model.num_image_token + "</img>"
-    value = human_value.replace("<image>", img)
+def build_query(model, human_value, counts=None):
+    """counts: число визуальных токенов на каждый <image> по порядку (после прунинга); None — все по num_image_token."""
+    parts = human_value.split("<image>")
+    counts = counts if counts is not None else [model.num_image_token] * (len(parts) - 1)
+    assert len(counts) == len(parts) - 1, f"{len(parts) - 1} x <image>, а счётчиков токенов {len(counts)}"
+    value = parts[0] + "".join("<img>" + "<IMG_CONTEXT>" * c + "</img>" + tail for c, tail in zip(counts, parts[1:]))
     return (f"<|im_start|>system\n{model.system_message}<|im_end|>\n"
             f"<|im_start|>user\n{value}<|im_end|>\n"
             f"<|im_start|>assistant\n")
 
 
-def predict(model, tok, transform, rec, letter_ids, device):
+def predict(model, tok, transform, rec, letter_ids, device, prune=None):
+    """-> (буква, вероятности, info). prune — словарь из main: token_ratio, token_random, topk, topk_ratio, seed."""
     import torch
     from PIL import Image
+    prune = prune or {}
+    info = {}
     with torch.inference_mode():
         pix = torch.stack([transform(Image.open(p)) for p in rec["image"]]).to(device, torch.bfloat16)
-        ids = tok(build_query(model, rec["conversations"][0]["value"]), return_tensors="pt").input_ids.to(device)
+        # ViT без flash-attn считает наивное внимание сразу на все кадры (16 x 16 голов x 1025^2);
+        # по чанкам результат тот же, а пик памяти в 4 раза меньше. extract_feature отдаёт выход mlp1:
+        # (кадров, токенов на кадр, D) — именно на нём авторы запускают DivPrune.
+        vit = torch.cat([model.extract_feature(pix[i:i + VIT_CHUNK]) for i in range(0, pix.shape[0], VIT_CHUNK)])
+        tpf = vit.shape[1]
+        if prune.get("topk"):
+            # Top-K авторов: балл кадра — доля его токенов, которую DivPrune оставил в пуле; адаптивный k
+            # (mass/elbow, retain 0.8) не больше topk; кадры по времени, финальный вызов на полных токенах.
+            # Признаки ViT у кадров независимы, поэтому выбранные просто вырезаются из пула.
+            kept = fsr.kept_by_frame(fsr.divprune(vit.reshape(-1, vit.shape[-1]).float(), prune["topk_ratio"]),
+                                     vit.shape[0], tpf)
+            scores = fsr.frame_scores(kept, tpf)
+            chosen = sorted(int(i) for i in fsr.select_frames_top_k(scores, max_k=prune["topk"]))
+            info.update(pool_frames=len(scores), frame_scores=[round(x, 4) for x in scores],
+                        topk_frames=[frame_number(rec["image"][i]) for i in chosen])
+            rec = set_frames(rec, [rec["image"][i] for i in chosen])
+            vit = vit[chosen]
+        flat, counts = vit.reshape(-1, vit.shape[-1]), None
+        if prune.get("token_ratio"):
+            # DivPrune совместно по всем кадрам клипа, внутри кадра токены в растровом порядке, как путь
+            # precomputed_token_masks у авторов; кадр может остаться совсем без токенов
+            if prune["token_random"]:
+                sel = fsr.random_prune(flat.shape[0], prune["token_ratio"],
+                                       zlib.crc32(f"{prune['seed']}/{rec['id']}".encode()))
+            else:
+                sel = fsr.divprune(flat.float(), prune["token_ratio"])
+            kept = fsr.kept_by_frame(sel, vit.shape[0], tpf)
+            counts = [len(v) for v in kept]
+            flat = torch.cat([vit[f, torch.as_tensor(v, dtype=torch.long, device=vit.device)] for f, v in enumerate(kept)])
+            info["kept_per_frame"] = counts
+        ids = tok(build_query(model, rec["conversations"][0]["value"], counts), return_tensors="pt").input_ids.to(device)
         # Нужен один вектор logits последней позиции, а model.forward считает их для всех 4.5k позиций
         # (в transformers 4.37 ещё и в fp32: 2.7 GB на сэмпл). Поэтому склеиваем эмбеддинги так же, как
         # InternVLChatModel.forward, и берём lm_head только от последнего скрытого состояния.
         emb = model.language_model.get_input_embeddings()(ids).clone()
-        # ViT без flash-attn считает наивное внимание сразу на все кадры (16 x 16 голов x 1025^2);
-        # по чанкам результат тот же, а пик памяти в 4 раза меньше
-        vit = torch.cat([model.extract_feature(pix[i:i + VIT_CHUNK]) for i in range(0, pix.shape[0], VIT_CHUNK)])
-        vit = vit.reshape(-1, emb.shape[-1])
         sel = ids[0] == model.img_context_token_id
-        assert int(sel.sum()) == vit.shape[0], f"IMG_CONTEXT {int(sel.sum())} != vit tokens {vit.shape[0]}"
-        emb[0, sel] = vit.to(emb.dtype)
+        assert int(sel.sum()) == flat.shape[0], f"IMG_CONTEXT {int(sel.sum())} != vit tokens {flat.shape[0]}"
+        emb[0, sel] = flat.to(emb.dtype)
         hidden = model.language_model.model(inputs_embeds=emb, attention_mask=torch.ones_like(ids)).last_hidden_state
         logits = model.language_model.lm_head(hidden[:, -1])[0, letter_ids].float()
         probs = torch.softmax(logits, dim=0).tolist()
-    return CLASSES[int(logits.argmax())], probs
+    info = dict(n_frames=len(rec["image"]), n_visual_tokens=int(flat.shape[0]), **info)
+    return CLASSES[int(logits.argmax())], probs, info
 
 
-def reselect_frames(rec, strategy, fsr_args):
-    """Та же запись, но кадры отобраны другой стратегией. Текст промпта не меняется; в формате статьи
-    перед ним пересобирается префикс "<image>\\n" под новое число кадров."""
-    for k in ("frames_dir", "n_frames", "flips"):
-        if k not in rec:
-            sys.exit(f"{rec['id']}: в jsonl нет поля {k} — пересоберите его текущим prepare_data.py")
-    idx = pick_frames(rec, strategy, **(fsr_args if strategy in fsr.AUTHOR_STRATEGIES else {}))
+def frame_number(path):
+    return int(os.path.splitext(os.path.basename(path))[0])
+
+
+def set_frames(rec, paths):
+    """Запись с другим набором кадров. В формате статьи перед текстом пересобирается префикс "<image>\\n"
+    под новое число кадров; промпт на 16 кадров число кадров не допускает."""
     human = rec["conversations"][0]["value"]
     if rec.get("prompt_format") == "paper":
         prefix = PAPER_IMAGE * len(rec["image"])
         assert human.startswith(prefix) and human.count("<image>") == len(rec["image"]), rec["id"]
-        human = PAPER_IMAGE * len(idx) + human[len(prefix):]
-    elif not (len(idx) == N_FRAMES == human.count("<image>")):
-        sys.exit(f"{rec['id']}: промпт записи рассчитан на {N_FRAMES} кадров, а {strategy} дал {len(idx)}; "
-                 f"для стратегий авторов нужны данные prepare_data.py --target paper")
+        human = PAPER_IMAGE * len(paths) + human[len(prefix):]
+    elif len(paths) != human.count("<image>"):
+        sys.exit(f"{rec['id']}: промпт записи рассчитан на {human.count('<image>')} кадров, а их {len(paths)}; "
+                 f"переменное число кадров (стратегии авторов, --topk) только у данных prepare_data.py --target paper")
     conv = [dict(rec["conversations"][0], value=human)] + rec["conversations"][1:]
-    return dict(rec, image=[os.path.join(rec["frames_dir"], f"{i:04d}.png") for i in idx], conversations=conv)
+    return dict(rec, image=list(paths), conversations=conv)
+
+
+def reselect_frames(rec, strategy, fsr_args):
+    """Та же запись, но кадры отобраны другой стратегией; текст промпта не меняется."""
+    for k in ("frames_dir", "n_frames", "flips"):
+        if k not in rec:
+            sys.exit(f"{rec['id']}: в jsonl нет поля {k} — пересоберите его текущим prepare_data.py")
+    idx = pick_frames(rec, strategy, **(fsr_args if strategy in fsr.AUTHOR_STRATEGIES else {}))
+    return set_frames(rec, [os.path.join(rec["frames_dir"], f"{i:04d}.png") for i in idx])
 
 
 # ----------------------------------------------------------------------------
@@ -277,6 +323,14 @@ def main():
     ap.add_argument("--max-frames", type=int, default=MAX_FRAMES, help="бюджет кадров для стратегий авторов")
     ap.add_argument("--num-surr", type=int, default=2, help="n в surr(n) и dense_sparse")
     ap.add_argument("--tail", type=int, default=0, help="n в tail(n)")
+    ap.add_argument("--token-ratio", type=float, default=None,
+                    help="оставить эту долю визуальных токенов: DivPrune совместно по всем кадрам клипа, как в статье")
+    ap.add_argument("--token-random", action="store_true",
+                    help="с --token-ratio: столько же токенов, но выбранных случайно (контроль для DivPrune)")
+    ap.add_argument("--topk", type=int, default=None, metavar="K",
+                    help="Top-K кадров из статьи: баллы кадров по DivPrune на всех кадрах записи (пул задаётся, например, "
+                         "--frame-selection dense_sparse --max-frames 30), адаптивный k не больше K, финал на полных токенах")
+    ap.add_argument("--topk-ratio", type=float, default=0.5, help="доля токенов DivPrune при подсчёте баллов кадров для --topk")
     ap.add_argument("--group-by", choices=("agent", "task"), default=None, help="метрики отдельно по группам + общая строка")
     ap.add_argument("--from-predictions", default=None, help="predictions.jsonl: пересчитать метрики без модели")
     ap.add_argument("--out-dir", default=None, help="по умолчанию <dir(data)>/eval/<split>_<base|ckpt>[_<frames>]")
@@ -298,6 +352,19 @@ def main():
     else:
         tb_tag = os.path.splitext(os.path.basename(args.data))[0]
     tb_step = args.step if args.step is not None else default_step(args.lora)
+    for name, r in (("--token-ratio", args.token_ratio), ("--topk-ratio", args.topk_ratio)):
+        if r is not None and not 0 < r <= 1:
+            sys.exit(f"{name} {r}: нужна доля в (0, 1]")
+    if args.token_random and args.token_ratio is None:
+        sys.exit("--token-random работает только вместе с --token-ratio")
+    if args.topk is not None and args.token_ratio is not None:
+        sys.exit("--topk и --token-ratio вместе не поддерживаются: финальный вызов Top-K идёт на полных токенах")
+    if args.topk is not None and args.topk < 1:
+        sys.exit(f"--topk {args.topk}: нужно K >= 1")
+    prune = None
+    if args.token_ratio is not None or args.topk is not None:
+        prune = {"token_ratio": args.token_ratio, "token_random": args.token_random, "topk": args.topk,
+                 "topk_ratio": args.topk_ratio, "seed": args.seed}
 
     if args.from_predictions:
         preds = load_jsonl(args.from_predictions)
@@ -330,10 +397,18 @@ def main():
     default_model = ap.get_default("model")
     tag = (os.path.basename(os.path.normpath(args.lora)) if args.lora else
            "base" if args.model == default_model else f"base-{os.path.basename(os.path.normpath(args.model))}")
+    suffix = ""
+    if args.frame_selection:
+        suffix += f"_{args.frame_selection}"
+        if args.frame_selection in fsr.AUTHOR_STRATEGIES and args.max_frames != MAX_FRAMES:
+            suffix += f"_mf{args.max_frames}"
+    if args.topk is not None:
+        suffix += f"_topk{args.topk}" + (f"r{args.topk_ratio:g}" if args.topk_ratio != ap.get_default("topk_ratio") else "")
+    if args.token_ratio is not None:
+        suffix += f"_{'rand' if args.token_random else 'tok'}{args.token_ratio:g}"
     out_dir = args.out_dir or os.path.join(
         os.path.dirname(os.path.abspath(args.data)), "eval",
-        f"{os.path.splitext(os.path.basename(args.data))[0]}_{tag}"
-        + (f"_{args.frame_selection}" if args.frame_selection else "") + (f"_limit{args.limit}" if args.limit else ""))
+        f"{os.path.splitext(os.path.basename(args.data))[0]}_{tag}{suffix}" + (f"_limit{args.limit}" if args.limit else ""))
     os.makedirs(out_dir, exist_ok=True)
     run_config = {
         "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -357,15 +432,15 @@ def main():
         for k, rec in enumerate(recs):
             gt = rec["conversations"][1]["value"][0]
             try:
-                p, probs = predict(model, tok, transform, rec, letter_ids, device)
+                p, probs, info = predict(model, tok, transform, rec, letter_ids, device, prune)
             except Exception as e:  # один битый эпизод не должен ронять весь прогон
                 failed += 1
                 print(f"fail {rec['id']}: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
                 continue
             row = {"id": rec["id"], "agent": rec.get("agent") or rec["id"].split("/")[0],
                    "task": rec.get("task") or re.sub(r"_\d+$", "", rec["id"].split("/")[-1]),
-                   "n_frames": len(rec["image"]), "gt": gt, "pred": p,
-                   "probs": {c: round(x, 5) for c, x in zip(CLASSES, probs)}}
+                   "n_frames": info.pop("n_frames"), "n_visual_tokens": info.pop("n_visual_tokens"), "gt": gt, "pred": p,
+                   "probs": {c: round(x, 5) for c, x in zip(CLASSES, probs)}, **info}
             preds.append(row)
             fout.write(json.dumps(row) + "\n")
             fout.flush()
@@ -377,9 +452,14 @@ def main():
         sys.exit("ни одного предсказания")
 
     s = summarize(preds, args.group_by)
-    print_summary(s, f"{tag}" + (f" [{args.frame_selection}]" if args.frame_selection else ""))
+    print_summary(s, f"{tag}{suffix}")
+    mean_frames = sum(p["n_frames"] for p in preds) / len(preds)
+    mean_tokens = sum(p["n_visual_tokens"] for p in preds) / len(preds)
+    print(f"\nв среднем на эпизод: кадров {mean_frames:.1f}, визуальных токенов {mean_tokens:.0f}")
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(dict(s, data=args.data, model=args.model, lora=args.lora, frame_selection=args.frame_selection,
+                       max_frames=args.max_frames if args.frame_selection in fsr.AUTHOR_STRATEGIES else None,
+                       prune=prune, mean_frames=mean_frames, mean_visual_tokens=mean_tokens,
                        n=len(preds), failed=failed, group_by=args.group_by), f, indent=1)
     print(f"\nsaved {out_dir}/{{predictions.jsonl,metrics.json,run_config.json}}")
     if args.tensorboard:

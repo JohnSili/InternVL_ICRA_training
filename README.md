@@ -217,9 +217,14 @@ done
 **3. Обучение** (в `tmux`; чекпоинт каждые полэпохи):
 
 ```bash
-N=$(wc -l < data/paper/train.jsonl); SAVE=$(( (N + 31) / 32 ))   # полэпохи при эффективном батче 2 x 8 = 16
+N=$(wc -l < data/paper/train.jsonl); SPE=$(( (N + 1) / 2 / 8 )); SAVE=$(( SPE / 2 ))   # шагов в эпохе при батче 2 x 8; полэпохи
+echo "train $N, шагов в эпохе $SPE, всего $((2 * SPE)), save_steps $SAVE"
 DATA=data/paper WATCH_VAL=0 EXTRA_ARGS="--save_strategy steps --save_steps $SAVE" bash train.sh 2>&1 | tee train_paper.log
 ```
+
+HF Trainer 4.37 считает шаги в эпохе как `ceil(N / 2) // 8` и сам не сохраняет чекпоинт на последнем шаге,
+поэтому число шагов `2 * SPE` должно делиться на `SAVE`. При нечётном `SPE` берите `SAVE=$SPE`. Для train 7240
+выходит 452 шага в эпохе, 904 всего, чекпоинты на 226, 452, 678 и 904.
 
 Возобновление: тот же запуск с `--resume_from_checkpoint $PWD/work_dirs/paper/checkpoint-K` в конце `EXTRA_ARGS`.
 

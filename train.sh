@@ -11,7 +11,7 @@
 # deepspeed, flash-attn — internvl_chat_finetune.py включает flash_attention_2 для LLM безусловно, tensorboard).
 # Скрипт сам подхватывает .venv рядом с собой, так что `bash train.sh` и `uv run bash train.sh` равнозначны.
 # Одна A100. Если OOM: PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACC=16 bash train.sh. max_dynamic_patch не трогать —
-# 16 кадров x 256 токенов = 4096, любой другой max_dynamic_patch раздует контекст в разы.
+# 16 кадров x 256 токенов = 4096 (20 кадров данных статьи = 5120), любой другой max_dynamic_patch раздует контекст в разы.
 #
 # Мониторинг: loss/lr тренера пишутся в OUTPUT_DIR/tensorboard (каждый шаг); watch_val.sh в фоне оценивает
 # каждый сохранённый checkpoint-N на val и пишет туда же val/macro_f1 и т.д.; tensorboard-сервер

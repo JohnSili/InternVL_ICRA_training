@@ -26,7 +26,8 @@ import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prepare_data import FRAME_SELECTIONS, N_FRAMES, select_frames  # noqa: E402
+from prepare_data import FRAME_SELECTIONS, MAX_FRAMES, N_FRAMES, PAPER_IMAGE, pick_frames  # noqa: E402
+import fsr  # noqa: E402
 
 CLASSES = "ABCDE"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -142,14 +143,23 @@ def predict(model, tok, transform, rec, letter_ids, device):
     return CLASSES[int(logits.argmax())], probs
 
 
-def reselect_frames(rec, strategy):
-    """Та же запись, но кадры отобраны другой стратегией; промпт (16 x <image>) не меняется."""
+def reselect_frames(rec, strategy, fsr_args):
+    """Та же запись, но кадры отобраны другой стратегией. Текст промпта не меняется; в формате статьи
+    перед ним пересобирается префикс "<image>\\n" под новое число кадров."""
     for k in ("frames_dir", "n_frames", "flips"):
         if k not in rec:
             sys.exit(f"{rec['id']}: в jsonl нет поля {k} — пересоберите его текущим prepare_data.py")
-    idx = select_frames(rec["n_frames"], rec["flips"], strategy)
-    assert len(idx) == N_FRAMES == rec["conversations"][0]["value"].count("<image>")
-    return dict(rec, image=[os.path.join(rec["frames_dir"], f"{i:04d}.png") for i in idx])
+    idx = pick_frames(rec, strategy, **(fsr_args if strategy in fsr.AUTHOR_STRATEGIES else {}))
+    human = rec["conversations"][0]["value"]
+    if rec.get("prompt_format") == "paper":
+        prefix = PAPER_IMAGE * len(rec["image"])
+        assert human.startswith(prefix) and human.count("<image>") == len(rec["image"]), rec["id"]
+        human = PAPER_IMAGE * len(idx) + human[len(prefix):]
+    elif not (len(idx) == N_FRAMES == human.count("<image>")):
+        sys.exit(f"{rec['id']}: промпт записи рассчитан на {N_FRAMES} кадров, а {strategy} дал {len(idx)}; "
+                 f"для стратегий авторов нужны данные prepare_data.py --target paper")
+    conv = [dict(rec["conversations"][0], value=human)] + rec["conversations"][1:]
+    return dict(rec, image=[os.path.join(rec["frames_dir"], f"{i:04d}.png") for i in idx], conversations=conv)
 
 
 # ----------------------------------------------------------------------------
@@ -264,7 +274,10 @@ def main():
     ap.add_argument("--lora", default=None, help="папка чекпоинта из train.sh; без флага — базовая модель")
     ap.add_argument("--frame-selection", choices=FRAME_SELECTIONS, default=None,
                     help="пересобрать кадры этой стратегией вместо тех, что в jsonl (ablation)")
-    ap.add_argument("--group-by", choices=("agent",), default=None, help="метрики отдельно по группам + общая строка")
+    ap.add_argument("--max-frames", type=int, default=MAX_FRAMES, help="бюджет кадров для стратегий авторов")
+    ap.add_argument("--num-surr", type=int, default=2, help="n в surr(n) и dense_sparse")
+    ap.add_argument("--tail", type=int, default=0, help="n в tail(n)")
+    ap.add_argument("--group-by", choices=("agent", "task"), default=None, help="метрики отдельно по группам + общая строка")
     ap.add_argument("--from-predictions", default=None, help="predictions.jsonl: пересчитать метрики без модели")
     ap.add_argument("--out-dir", default=None, help="по умолчанию <dir(data)>/eval/<split>_<base|ckpt>[_<frames>]")
     ap.add_argument("--limit", type=int, default=None, help="первые N записей (смоук)")
@@ -310,9 +323,13 @@ def main():
     if not recs:
         sys.exit(f"пусто: {args.data}")
     if args.frame_selection:
-        recs = [reselect_frames(r, args.frame_selection) for r in recs]
+        fsr_args = {"max_frames": args.max_frames, "num_surr": args.num_surr, "tail": args.tail}
+        recs = [reselect_frames(r, args.frame_selection, fsr_args) for r in recs]
 
-    tag = os.path.basename(os.path.normpath(args.lora)) if args.lora else "base"
+    # у другой базовой модели своя папка, иначе zero-shot InternVL3-8B перезапишет результаты 2B
+    default_model = ap.get_default("model")
+    tag = (os.path.basename(os.path.normpath(args.lora)) if args.lora else
+           "base" if args.model == default_model else f"base-{os.path.basename(os.path.normpath(args.model))}")
     out_dir = args.out_dir or os.path.join(
         os.path.dirname(os.path.abspath(args.data)), "eval",
         f"{os.path.splitext(os.path.basename(args.data))[0]}_{tag}"
@@ -345,7 +362,9 @@ def main():
                 failed += 1
                 print(f"fail {rec['id']}: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
                 continue
-            row = {"id": rec["id"], "agent": rec.get("agent") or rec["id"].split("/")[0], "gt": gt, "pred": p,
+            row = {"id": rec["id"], "agent": rec.get("agent") or rec["id"].split("/")[0],
+                   "task": rec.get("task") or re.sub(r"_\d+$", "", rec["id"].split("/")[-1]),
+                   "n_frames": len(rec["image"]), "gt": gt, "pred": p,
                    "probs": {c: round(x, 5) for c, x in zip(CLASSES, probs)}}
             preds.append(row)
             fout.write(json.dumps(row) + "\n")

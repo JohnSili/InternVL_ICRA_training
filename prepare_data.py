@@ -4,6 +4,8 @@
     python3 prepare_data.py --root /data/trajectories --out data/cls
     python3 prepare_data.py --root ~/Simpler/trajectories --ann-root ~/Simpler/gt --out data/cls
     python3 prepare_data.py --root ... --out data/obs --target obs --balance --drop-recovery
+    python3 prepare_data.py --out data/paper --target paper --frame-selection dense_sparse --max-frames 20 \
+        --holdout-list data/cls/heldout400.txt --val-frac 0.03 --exclude-manual      # постановка статьи
 
 Кадры и actions всегда из --root (<агент>/{meta,frames}). Метки: без --ann-root из meta (ручная
 разметка), с --ann-root из <агент>/<имя>_auto.json; held-out берёт тот же источник, что train, а
@@ -26,11 +28,18 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-N_FRAMES = 16
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fsr  # noqa: E402  отбор кадров и токенов так, как в коде статьи
+
+N_FRAMES = 16  # фиксированное число кадров у прежних стратегий: surr2 и legacy_*
+MAX_FRAMES = 20  # бюджет кадров у стратегий авторов статьи; число кадров у них переменное
 KEY_WINDOW = 2  # ±кадров вокруг смены команды гриппера (surr2)
 MIN_UNIFORM = 4  # столько кадров всегда берём равномерно по эпизоду, даже если ключевых много
-DENSE = 8  # dense_sparse: подряд идущих кадров вокруг первого закрытия гриппера
-FRAME_SELECTIONS = ("surr2", "uniform", "dense_sparse")
+DENSE = 8  # legacy_dense8: подряд идущих кадров вокруг первого закрытия гриппера
+# legacy_uniform и legacy_dense8 назывались uniform и dense_sparse до перехода на функции авторов:
+# имена из статьи теперь занимают их реализации из fsr.py
+LEGACY_SELECTIONS = ("surr2", "legacy_uniform", "legacy_dense8")
+FRAME_SELECTIONS = LEGACY_SELECTIONS + fsr.AUTHOR_STRATEGIES
 CLASSES = "ABCDE"
 OBSERVATIONS = [
     "gripper_approaches_wrong_object",
@@ -46,15 +55,20 @@ OBSERVATIONS = [
     "object_dropped_during_transport",  # из gt-разметки, в словаре ТЗ его нет
 ]
 
-# Эталонный текст human-хода (16 x "Frame k: <image>" + инструкция + описание классов) лежит в
-# prompt_cls.txt / prompt_obs.txt рядом со скриптом; test_pipeline.py сверяет jsonl с ним побуквенно.
-PROMPT_FILES = {t: os.path.join(os.path.dirname(os.path.abspath(__file__)), f"prompt_{t}.txt") for t in ("cls", "obs")}
+# Эталонный текст human-хода лежит рядом со скриптом; test_pipeline.py сверяет jsonl с ним побуквенно.
+# prompt_cls.txt / prompt_obs.txt: 16 x "Frame k: <image>" внутри файла.
+# prompt_paper.txt: промпт авторов с классами под разметку gt; картинки идут перед ним как "<image>\n" x N,
+# как в build_record у авторов, поэтому число кадров может быть любым.
+PROMPT_FILES = {t: os.path.join(os.path.dirname(os.path.abspath(__file__)), f"prompt_{t}.txt")
+                for t in ("cls", "obs", "paper")}
+PAPER_IMAGE = "<image>\n"
 
 
 def load_prompt(target):
     with open(PROMPT_FILES[target]) as f:
         text = f.read()
-    assert text.count("<image>") == N_FRAMES, f"{PROMPT_FILES[target]}: {text.count('<image>')} x <image>, ожидалось {N_FRAMES}"
+    want = 0 if target == "paper" else N_FRAMES
+    assert text.count("<image>") == want, f"{PROMPT_FILES[target]}: {text.count('<image>')} x <image>, ожидалось {want}"
     assert "{instruction}" in text, f"{PROMPT_FILES[target]}: нет плейсхолдера {{instruction}}"
     return text
 
@@ -183,13 +197,13 @@ def select_frames(n, flips, strategy="surr2", rng=None, jitter=False):
     """N_FRAMES индексов кадров по возрастанию.
 
     surr2       : ±KEY_WINDOW вокруг каждой смены команды гриппера + равномерная добивка
-    uniform     : равномерно по всему эпизоду
-    dense_sparse: DENSE кадров подряд вокруг первого закрытия гриппера + равномерная добивка
+    legacy_uniform: равномерно по всему эпизоду
+    legacy_dense8 : DENSE кадров подряд вокруг первого закрытия гриппера + равномерная добивка
     rng=None или jitter=False -> детерминированно (центры бинов). Короткий эпизод -> дубли последнего.
     """
     if n <= N_FRAMES:
         return list(range(n)) + [n - 1] * (N_FRAMES - n)
-    if strategy == "uniform":
+    if strategy == "legacy_uniform":
         return sorted(_uniform(list(range(n)), N_FRAMES, rng, jitter))
     if strategy == "surr2":
         key = set()
@@ -202,7 +216,7 @@ def select_frames(n, flips, strategy="surr2", rng=None, jitter=False):
             # много переключений: прореживаем ключевые, иначе начало/конец эпизода выпадут совсем
             k = N_FRAMES - MIN_UNIFORM
             key = sorted({key[round(i * (len(key) - 1) / (k - 1))] for i in range(k)})
-    elif strategy == "dense_sparse":
+    elif strategy == "legacy_dense8":
         closes = [t for t, v in flips if v < 0]
         t = closes[0] if closes else (flips[0][0] if flips else n // 2)
         start = min(max(0, t - DENSE // 2 + 1), n - DENSE)
@@ -216,19 +230,31 @@ def select_frames(n, flips, strategy="surr2", rng=None, jitter=False):
 _PROMPT_CACHE = {}
 
 
-def make_record(ep, target, strategy, rng=None, jitter=False):
+def pick_frames(ep, strategy, max_frames=MAX_FRAMES, num_surr=2, tail=0, rng=None, jitter=False):
+    """Индексы кадров эпизода. Стратегии авторов берут ключевые кадры по смене команды гриппера, как
+    find_gripper_change у них, и работают без джиттера; прежние стратегии дают ровно N_FRAMES."""
+    if strategy in fsr.AUTHOR_STRATEGIES:
+        return fsr.select(strategy, ep["n_frames"], [t for t, _ in ep["flips"]], max_frames, num_surr, tail)
+    return select_frames(ep["n_frames"], ep["flips"], strategy, rng, jitter)
+
+
+def make_record(ep, target, strategy, rng=None, jitter=False, fsr_args=None):
     if target not in _PROMPT_CACHE:
         _PROMPT_CACHE[target] = load_prompt(target)
-    idx = select_frames(ep["n_frames"], ep["flips"], strategy, rng, jitter)
+    fsr_args = fsr_args or {}
+    idx = pick_frames(ep, strategy, rng=rng, jitter=jitter, **fsr_args)
     paths = [os.path.join(ep["frames_dir"], f"{i:04d}.png") for i in idx]
-    prompt = _PROMPT_CACHE[target].replace("{instruction}", ep["instruction"])
-    answer = ep["cls"] if target == "cls" else f"{ep['cls']}|{ep['obs']}"
+    body = _PROMPT_CACHE[target].replace("{instruction}", ep["instruction"])
+    prompt = PAPER_IMAGE * len(paths) + body if target == "paper" else body
+    answer = f"{ep['cls']}|{ep['obs']}" if target == "obs" else ep["cls"]
     # InternVL читает только id/image/conversations; остальное нужно evaluate.py (группировка по
-    # агенту, пересбор кадров под другую стратегию) и test_pipeline.py (сверка промпта с эталоном)
+    # агенту и задаче, пересбор кадров под другую стратегию) и test_pipeline.py (сверка промпта с эталоном)
     return {"id": ep["id"], "image": paths, "conversations": [
         {"from": "human", "value": prompt}, {"from": "gpt", "value": answer}],
-        "agent": ep["agent"], "cls": ep["cls"], "instruction": ep["instruction"], "frames_dir": ep["frames_dir"],
-        "n_frames": ep["n_frames"], "flips": ep["flips"], "frame_selection": strategy}
+        "agent": ep["agent"], "task": ep["task"], "cls": ep["cls"], "instruction": ep["instruction"],
+        "frames_dir": ep["frames_dir"], "n_frames": ep["n_frames"], "flips": ep["flips"],
+        "frame_selection": strategy, "fsr_args": fsr_args,
+        "prompt_format": "paper" if target == "paper" else "frames16"}
 
 
 def ep_rng(seed, eid, copy):
@@ -281,8 +307,15 @@ def main():
     ap.add_argument("--drop-unresolved", action="store_true",
                     help="убрать из train и val эпизоды с unresolved=true в gt-разметке")
     ap.add_argument("--out", default="data/cls")
-    ap.add_argument("--target", choices=("cls", "obs"), default="cls")
+    ap.add_argument("--target", choices=("cls", "obs", "paper"), default="cls",
+                    help="cls/obs: промпт из ТЗ на 16 кадров; paper: промпт статьи, ответ одной буквой")
     ap.add_argument("--frame-selection", choices=FRAME_SELECTIONS, default="surr2")
+    ap.add_argument("--max-frames", type=int, default=MAX_FRAMES, help="бюджет кадров для стратегий авторов")
+    ap.add_argument("--num-surr", type=int, default=2, help="кадров до и после смены гриппера, n в surr(n)")
+    ap.add_argument("--tail", type=int, default=0, help="кадров из конца эпизода, n в tail(n)")
+    ap.add_argument("--exclude-manual", action="store_true",
+                    help="эпизоды с ручной разметкой убрать из train и val и записать в heldout_human.jsonl "
+                         "с ручными метками; требует --ann-root")
     ap.add_argument("--holdout-list", default=None, help="файл с id held-out (по умолчанию <out>/heldout.txt)")
     ap.add_argument("--holdout-frac", type=float, default=0.25, help="доля на held-out, если список ещё не создан")
     ap.add_argument("--holdout-per-group", type=int, default=None, metavar="N",
@@ -304,6 +337,11 @@ def main():
         sys.exit(f"--root {args.root} не существует (или задайте VLA_META_ROOT)")
     if args.ann_root and not os.path.isdir(args.ann_root):
         sys.exit(f"--ann-root {args.ann_root} не существует")
+    if args.exclude_manual and not args.ann_root:
+        sys.exit("--exclude-manual имеет смысл только с --ann-root: без него ручная разметка и есть обучающая")
+    if args.frame_selection in fsr.AUTHOR_STRATEGIES and args.target != "paper":
+        sys.exit(f"{args.frame_selection} даёт переменное число кадров, а промпт {args.target} рассчитан на 16: "
+                 f"используйте --target paper")
 
     os.makedirs(args.out, exist_ok=True)
     eps = load_episodes(args.root, args.ann_root)
@@ -356,6 +394,15 @@ def main():
         print(f"warning: {len(missing)} held-out id без разметки {hold_src}, выпали из held-out: "
               f"{sorted(missing)[:5]}", file=sys.stderr)
     rest = [e for e in labeled(eps, train_src) if e["id"] not in hold_ids]
+    human = []
+    if args.exclude_manual:
+        human = sorted(labeled(eps, "manual"), key=lambda e: e["id"])
+        manual_ids = {e["id"] for e in human}
+        n0 = len(rest)
+        rest = [e for e in rest if e["id"] not in manual_ids]
+        groups = Counter(f"{e['agent']}/{e['task']}" for e in human)
+        print(f"exclude-manual: из train/val убрано {n0 - len(rest)} эпизодов с ручной разметкой; "
+              f"heldout_human: {len(human)}, по агентам и задачам {dict(sorted(groups.items()))}")
 
     if args.drop_recovery:
         n0 = len(rest)
@@ -369,8 +416,10 @@ def main():
     val, train = stratified_take(rest, args.val_frac, random.Random(args.seed + 1))
 
     # --- защита от утечки ---------------------------------------------------
-    ids = {k: {e["id"] for e in v} for k, v in (("train", train), ("val", val), ("heldout", heldout))}
-    for a, b in (("train", "heldout"), ("val", "heldout"), ("train", "val")):
+    ids = {k: {e["id"] for e in v} for k, v in (("train", train), ("val", val), ("heldout", heldout),
+                                               ("heldout_human", human))}
+    for a, b in (("train", "heldout"), ("val", "heldout"), ("train", "val"),
+                 ("train", "heldout_human"), ("val", "heldout_human")):
         inter = ids[a] & ids[b]
         assert not inter, f"утечка {a}∩{b}: {sorted(inter)[:5]}"
 
@@ -378,15 +427,22 @@ def main():
     cnt = Counter(e["cls"] for e in train)
     factor = {c: min(5, cnt.most_common(1)[0][1] // n) for c, n in cnt.items()} if args.balance else {}
     fs = args.frame_selection
+    fsr_args = ({"max_frames": args.max_frames, "num_surr": args.num_surr, "tail": args.tail}
+                if fs in fsr.AUTHOR_STRATEGIES else None)
     train_recs = []
     for e in train:
         for k in range(args.copies * factor.get(e["cls"], 1)):
-            train_recs.append(make_record(e, args.target, fs, ep_rng(args.seed, e["id"], k), jitter=True))
+            train_recs.append(make_record(e, args.target, fs, ep_rng(args.seed, e["id"], k), jitter=True,
+                                          fsr_args=fsr_args))
     random.Random(args.seed).shuffle(train_recs)
-    val_recs = [make_record(e, args.target, fs) for e in sorted(val, key=lambda e: e["id"])]
-    hold_recs = [make_record(e, args.target, fs) for e in sorted(heldout, key=lambda e: e["id"])]
+    val_recs = [make_record(e, args.target, fs, fsr_args=fsr_args) for e in sorted(val, key=lambda e: e["id"])]
+    hold_recs = [make_record(e, args.target, fs, fsr_args=fsr_args) for e in sorted(heldout, key=lambda e: e["id"])]
+    human_recs = [make_record(e, args.target, fs, fsr_args=fsr_args) for e in human]
+    splits = [("train", train_recs), ("val", val_recs), ("heldout", hold_recs)]
+    if human:
+        splits.append(("heldout_human", human_recs))
 
-    for name, recs in (("train", train_recs), ("val", val_recs), ("heldout", hold_recs)):
+    for name, recs in splits:
         write_jsonl(os.path.join(args.out, f"{name}.jsonl"), recs)
     train_path = os.path.abspath(os.path.join(args.out, "train.jsonl"))
     with open(os.path.join(args.out, "meta.json"), "w") as f:
@@ -395,10 +451,14 @@ def main():
     with open(os.path.join(args.out, "prepare_config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    print(f"\n{'':8s}" + "".join(f"{c:>6s}" for c in CLASSES) + f"{'total':>8s}")
-    for name, recs in (("train", train_recs), ("val", val_recs), ("heldout", hold_recs)):
+    print(f"\n{'':14s}" + "".join(f"{c:>6s}" for c in CLASSES) + f"{'total':>8s}")
+    for name, recs in splits:
         c = Counter(r["cls"] for r in recs)
-        print(f"{name:8s}" + "".join(f"{c.get(k, 0):6d}" for k in CLASSES) + f"{len(recs):8d}")
+        print(f"{name:14s}" + "".join(f"{c.get(k, 0):6d}" for k in CLASSES) + f"{len(recs):8d}")
+    if fsr_args:
+        counts = sorted(len(r["image"]) for _, recs in splits for r in recs)
+        print(f"кадров на эпизод: min {counts[0]}, медиана {counts[len(counts) // 2]}, max {counts[-1]} "
+              f"при бюджете {args.max_frames}")
     if factor:
         print(f"balance factors: {factor}")
     by_group = Counter((e["agent"], e["task"]) for e in heldout)
@@ -409,7 +469,7 @@ def main():
         print(f"gt confidence в train/val: {dict(sorted(conf.items()))}")
     if args.ann_root:
         agreement_report(eps)
-    print(f"\nframe selection: {fs}; written to {args.out}: train.jsonl val.jsonl heldout.jsonl meta.json")
+    print(f"\nframe selection: {fs}; written to {args.out}: " + " ".join(f"{n}.jsonl" for n, _ in splits) + " meta.json")
 
 
 if __name__ == "__main__":

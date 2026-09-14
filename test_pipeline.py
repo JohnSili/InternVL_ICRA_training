@@ -27,12 +27,13 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from prepare_data import CLASSES, OBSERVATIONS  # noqa: E402  словарь ответов — тот же, что у генератора
+from prepare_data import CLASSES, OBSERVATIONS, PAPER_IMAGE  # noqa: E402  словарь ответов — тот же, что у генератора
+from fsr import AUTHOR_STRATEGIES  # noqa: E402
 
 META_ROOT = os.path.expanduser(os.environ.get("VLA_META_ROOT", "/data/trajectories"))
 DATA_OUT = os.path.abspath(os.path.expanduser(os.environ.get("VLA_DATA_OUT", os.path.join(HERE, "data", "cls"))))
 MODEL = os.environ.get("VLA_MODEL", "OpenGVLab/InternVL3-2B")
-N_FRAMES = int(os.environ.get("VLA_N_FRAMES", 16))  # контракт: столько кадров ждёт тренер и evaluate.py
+N_FRAMES = int(os.environ.get("VLA_N_FRAMES", 16))  # контракт прежних стратегий; у стратегий авторов — бюджет из prepare_config
 TRAIN_SH = os.path.join(HERE, "train.sh")
 REPO = os.path.abspath(os.environ.get("REPO", os.path.join(HERE, "InternVL", "internvl_chat")))
 SEED = int(os.environ.get("VLA_SEED", 0))
@@ -99,7 +100,7 @@ def data():
     if not os.path.exists(train_path):
         pytest.skip(f"нет {train_path}: сначала prepare_data.py --out {DATA_OUT} (или VLA_DATA_OUT=...)")
     d = {"errors": [], "splits": {}}
-    for split in ("train", "val", "heldout"):
+    for split in ("train", "val", "heldout", "heldout_human"):
         p = os.path.join(DATA_OUT, f"{split}.jsonl")
         if os.path.exists(p):
             recs, errors = load_jsonl(p)
@@ -123,6 +124,9 @@ def data():
     d["target"] = d["prepare_config"].get("target") or (
         "obs" if any("|" in str(answer(r)) for r in d["train"] if isinstance(r.get("conversations"), list)
                      and len(r["conversations"]) == 2) else "cls")
+    # стратегии авторов дают переменное число кадров в пределах бюджета, прежние — ровно N_FRAMES
+    d["variable_frames"] = d["prepare_config"].get("frame_selection") in AUTHOR_STRATEGIES
+    d["max_frames"] = int(d["prepare_config"]["max_frames"]) if d["variable_frames"] else N_FRAMES
     return d
 
 
@@ -219,7 +223,7 @@ def system_message(cfg):
 
 @pytest.fixture(scope="session")
 def token_budget(data, tokenizer, model_config, train_args):
-    """Аналитический бюджет: самый длинный промпт + N_FRAMES * токенов_на_тайл * max_dynamic_patch."""
+    """Аналитический бюджет: самый длинный промпт + макс. число кадров * токенов_на_тайл * max_dynamic_patch."""
     image_size = int(train_args["force_image_size"])
     tpt = tokens_per_tile(model_config, image_size)
     mdp = int(train_args["max_dynamic_patch"])
@@ -230,7 +234,8 @@ def token_budget(data, tokenizer, model_config, train_args):
         query = (f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n"
                  f"{h.replace('<image>', '<img></img>')}<|im_end|>\n<|im_start|>assistant\n{a}<|im_end|>\n")
         longest = max(longest, len(tokenizer(query).input_ids))
-    return {"text": longest, "image": N_FRAMES * tpt * mdp, "total": longest + N_FRAMES * tpt * mdp,
+    n_img = max((len(r["image"]) for _, r in ok_recs(data)), default=data["max_frames"])
+    return {"text": longest, "image": n_img * tpt * mdp, "total": longest + n_img * tpt * mdp, "n_frames": n_img,
             "tokens_per_tile": tpt, "max_dynamic_patch": mdp, "n_unique_prompts": n_uniq}
 
 
@@ -271,9 +276,11 @@ def test_image_placeholder_count(data):
     report("число кадров != число <image> (тренер InternVL упадёт на этом сэмпле)", bad, len(data["all"]))
 
 
-def test_fixed_n_frames(data):
-    bad = [(r["id"], f"{split}: {len(r['image'])} кадров") for split, r in ok_recs(data) if len(r["image"]) != N_FRAMES]
-    report(f"не {N_FRAMES} кадров", bad, len(data["all"]))
+def test_n_frames(data):
+    lo, hi = (1, data["max_frames"]) if data["variable_frames"] else (N_FRAMES, N_FRAMES)
+    bad = [(r["id"], f"{split}: {len(r['image'])} кадров") for split, r in ok_recs(data)
+           if not lo <= len(r["image"]) <= hi]
+    report(f"число кадров вне [{lo}, {hi}]", bad, len(data["all"]))
 
 
 def test_paths_absolute(data):
@@ -319,7 +326,8 @@ def test_frames_sorted_no_dups(data):
         if len(uniq) != len(idx):
             n = r.get("n_frames")
             tail_only = idx[:len(uniq)] == uniq and all(i == uniq[-1] for i in idx[len(uniq):])
-            if not (tail_only and n is not None and n < N_FRAMES and uniq[-1] == n - 1):
+            # повтор последнего кадра допустим только у прежних стратегий на эпизоде короче N_FRAMES
+            if not (not data["variable_frames"] and tail_only and n is not None and n < N_FRAMES and uniq[-1] == n - 1):
                 bad.append((r["id"], f"дубли не в хвосте короткого эпизода (n_frames={n}): {idx}"))
     report("кадры не отсортированы или дублируются", bad, len(data["all"]))
 
@@ -331,7 +339,7 @@ def test_answers_valid(data):
         a = answer(r)
         if a != a.strip() or "\n" in a or not a:
             bad.append((r["id"], f"{split}: пробелы/перевод строки/пусто: {a!r}"))
-        elif data["target"] == "cls":
+        elif data["target"] in ("cls", "paper"):
             if a not in letters:
                 bad.append((r["id"], f"{split}: {a!r} не буква из {CLASSES}"))
         else:
@@ -348,7 +356,9 @@ def test_prompt_matches_reference(data):
     assert os.path.exists(ref_path), f"нет эталонного промпта {ref_path}"
     with open(ref_path) as f:
         ref = f.read()
-    assert ref.count("<image>") == N_FRAMES, f"{ref_path}: {ref.count('<image>')} x <image>, ожидалось {N_FRAMES}"
+    # в промпте статьи картинок в файле нет: перед текстом стоит "<image>\n" на каждый кадр записи
+    n_ref = 0 if data["target"] == "paper" else N_FRAMES
+    assert ref.count("<image>") == n_ref, f"{ref_path}: {ref.count('<image>')} x <image>, ожидалось {n_ref}"
     bad = []
     for split, r in ok_recs(data):
         instr = r.get("instruction")
@@ -356,6 +366,8 @@ def test_prompt_matches_reference(data):
             bad.append((r["id"], f"{split}: нет поля instruction — пересоберите jsonl текущим prepare_data.py"))
             continue
         expected = ref.replace("{instruction}", instr)
+        if data["target"] == "paper":
+            expected = PAPER_IMAGE * len(r["image"]) + expected
         got = human(r)
         if got != expected:
             k = next((i for i, (x, y) in enumerate(zip(got, expected)) if x != y), min(len(got), len(expected)))
@@ -398,21 +410,24 @@ def test_no_leakage_train_val(data):
 
 
 def test_no_leakage_heldout(data, request):
-    if data["heldout_ids"] is None:
-        pytest.skip(f"нет списка held-out и heldout.jsonl в {DATA_OUT}")
-    say(request, f"held-out: {len(data['heldout_ids'])} id из {data['heldout_list'] or 'heldout.jsonl'}")
+    human_ids = {r["id"] for s, r in ok_recs(data) if s == "heldout_human"}
+    if data["heldout_ids"] is None and not human_ids:
+        pytest.skip(f"нет списка held-out, heldout.jsonl и heldout_human.jsonl в {DATA_OUT}")
+    tests = {"held-out": data["heldout_ids"] or set(), "heldout_human": human_ids}
+    say(request, f"held-out: {len(tests['held-out'])} id из {data['heldout_list'] or 'heldout.jsonl'}; "
+                 f"heldout_human: {len(human_ids)} id")
     train_ids = {r["id"] for s, r in ok_recs(data) if s == "train"}
     val_ids = {r["id"] for s, r in ok_recs(data) if s == "val"}
-    bad = [(i, "held-out ∩ train") for i in sorted(data["heldout_ids"] & train_ids)]
-    bad += [(i, "held-out ∩ val") for i in sorted(data["heldout_ids"] & val_ids)]
-    report("утечка held-out в train/val (обесценивает эксперимент)", bad, len(data["heldout_ids"]))
+    bad = [(i, f"{name} ∩ {split}") for name, ids in tests.items()
+           for split, other in (("train", train_ids), ("val", val_ids)) for i in sorted(ids & other)]
+    report("утечка тестовых эпизодов в train/val (обесценивает эксперимент)", bad, len(tests["held-out"] | human_ids))
 
 
 def test_class_distribution(data, request):
     dist = {s: Counter(answer(r)[0] for _, r in ok_recs(data) if _ == s) for s in data["splits"]}
-    lines = [f"class distribution ({DATA_OUT}):", f"{'':8s}" + "".join(f"{c:>6s}" for c in CLASSES) + f"{'total':>7s}"]
+    lines = [f"class distribution ({DATA_OUT}):", f"{'':14s}" + "".join(f"{c:>6s}" for c in CLASSES) + f"{'total':>7s}"]
     for s, c in dist.items():
-        lines.append(f"{s:8s}" + "".join(f"{c.get(k, 0):6d}" for k in CLASSES) + f"{sum(c.values()):7d}")
+        lines.append(f"{s:14s}" + "".join(f"{c.get(k, 0):6d}" for k in CLASSES) + f"{sum(c.values()):7d}")
     say(request, "\n".join(lines))
     bad = [(s, f"нет классов {[c for c in CLASSES if not dist[s].get(c)]}") for s in ("train", "val")
            if s in dist and any(not dist[s].get(c) for c in CLASSES)]
@@ -435,7 +450,7 @@ def test_model_config_reads(model_config, train_args, request):
 def test_token_budget(token_budget, train_args, request):
     max_len = int(train_args["max_seq_length"])
     b = token_budget
-    say(request, f"token budget: text<={b['text']} + images {N_FRAMES}x{b['tokens_per_tile']}x{b['max_dynamic_patch']}"
+    say(request, f"token budget: text<={b['text']} + images {b['n_frames']}x{b['tokens_per_tile']}x{b['max_dynamic_patch']}"
                  f"={b['image']} -> {b['total']} of max_seq_length={max_len} ({100 * b['total'] / max_len:.0f}%)")
     assert b["total"] <= max_len * (1 - SEQ_MARGIN), (
         f"бюджет {b['total']} токенов > {1 - SEQ_MARGIN:.0%} от max_seq_length={max_len}: "
@@ -513,7 +528,7 @@ def test_report_epoch_estimate(data, train_args, request):
     steps = math.ceil(n / eff)
     say(request, f"epoch estimate: {n} samples, effective batch {bs}x{acc}x{gpus}={eff}, "
                  f"{steps} steps/epoch, {epochs:g} epochs -> {math.ceil(steps * epochs)} optimizer steps "
-                 f"({n * epochs:.0f} forward/backward of {N_FRAMES} frames each)")
+                 f"({n * epochs:.0f} forward/backward of up to {data['max_frames']} frames each)")
     assert n >= eff, f"train ({n}) меньше effective batch ({eff}): ни одного полного шага"
 
 

@@ -1,0 +1,34 @@
+You are an expert robot manipulation analyst with extensive experience in robotic vision, manipulation planning, and error diagnosis. Your task is to analyze robot manipulation sequences and classify errors with high precision.
+
+The images above are frames of one episode in chronological order. The robot was instructed to: "{instruction}".
+
+Task: Choose the PRIMARY outcome label for the whole sequence.
+Rule: If multiple issues occur, choose the FIRST failure point that causes the task to break down. Check holding first: if the object ever moved together with the gripper, the label cannot be A or B.
+If the sequence succeeds (no major failure), choose E.
+
+Options (answer with EXACTLY one letter: A, B, C, D, or E):
+
+A) TARGET POSITION ERROR
+  - Definition: The gripper never reaches the target object; the object is not touched during the whole episode
+  - Manifestations: Gripper stops or closes before/beside/behind the object, too far from the target
+  - Example: "Gripper descends 5cm away from the carrot and closes on the empty table"
+
+B) GRASPING ERROR
+  - Definition: The gripper reaches or touches the object, but never holds it; the object never moves together with the gripper
+  - Manifestations: Gripper closes beside the object, closes without securing it, pushes the object, the object slips out while closing
+  - Example: "Gripper touches the spoon and closes, but the spoon stays on the table"
+
+C) TRAJECTORY ERROR
+  - Definition: The arm collides with an unrelated object or gets stuck; motion commands continue but the arm makes no progress
+  - Manifestations: Collisions with static objects, stuck configurations, repeated motion without progress
+  - Example: "Gripper hits the sink edge during approach and stays blocked there"
+
+D) TRANSFER ERROR
+  - Definition: The object was grasped and lifted, but then dropped, released outside the target, or never released
+  - Manifestations: Dropping during transport, premature release, object still held at the end of the episode
+  - Example: "Robot lifts the eggplant but drops it halfway to the basket"
+
+E) NO_MAJOR_ERROR
+  - The object is carried and placed inside the target zone.
+
+Return only the single letter.

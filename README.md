@@ -126,7 +126,7 @@ python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/bes
 PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACC=16 DATA=data/cls bash train.sh          # если OOM
 python3 prepare_data.py --out data/obs --target obs --balance --drop-recovery --holdout-list data/cls/heldout400.txt
 DATA=data/obs bash train.sh                                                  # ответ <класс>|<симптом>, oversampling редких классов
-for fs in surr2 uniform dense_sparse; do                                     # ablation по стратегии отбора кадров
+for fs in surr2 legacy_uniform legacy_dense8; do                             # ablation по стратегии отбора кадров (16 кадров)
   python3 evaluate.py --data data/cls/heldout.jsonl --lora $(cat work_dirs/cls/best_checkpoint.txt) --frame-selection $fs
 done
 ```
@@ -175,6 +175,66 @@ python3 evaluate.py --data data/cls_manual/heldout.jsonl --lora $(cat work_dirs/
 разметок на этих 141: 66.7%. По классам оно неравномерно: E совпадает полностью (52 из 52), а из 17 эпизодов,
 размеченных человеком как C, gt не назвал C ни одного (12 ушли в B, 4 в E, 1 в D). Это потолок для любого
 сравнения с человеческим суждением и причина не ждать высокого macro-F1 на классе C.
+
+## Постановка статьи: до 20 кадров, промпт авторов, человеческий тест
+
+Все таблицы статьи считаются на одних данных (наши 8000 эпизодов, без SpatialVLA) и одной эталонной
+конфигурации. Отличия от `data/cls`:
+
+- кадры отбирают функции авторов из `fsr.py` (`uniform`, `dense_sparse`, `surrounding`), бюджет 20, число
+  кадров переменное. Совпадение с кодом авторов проверено на всех эпизодах;
+- промпт `prompt_paper.txt`: структура `prompt_for_train.txt` авторов, определения классов по разметке gt,
+  картинки идут перед текстом как `<image>\n` на кадр, ответ одной буквой;
+- `--exclude-manual`: 141 эпизод с ручной разметкой убран из train и val и записан в `heldout_human.jsonl`
+  с ручными метками. Held-out 400 на gt-метках тот же, что у первого прогона.
+
+Прежние 16-кадровые стратегии переименованы: `legacy_uniform`, `legacy_dense8`, `surr2` без изменений.
+
+**1. Данные:**
+
+```bash
+source .venv/bin/activate && export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+python3 prepare_data.py --root ~/Simpler/trajectories --ann-root ~/Simpler/gt --out data/paper --target paper \
+  --frame-selection dense_sparse --max-frames 20 --holdout-list data/cls/heldout400.txt --val-frac 0.03 --exclude-manual
+VLA_DATA_OUT=data/paper pytest test_pipeline.py -q -m "not gpu and not slow"
+```
+
+**2. Выбор стратегии кадров по val** (zero-shot, кадры пересобираются на лету, разбивка одна):
+
+```bash
+for fs in dense_sparse uniform surrounding; do python3 evaluate.py --data data/paper/val.jsonl --frame-selection $fs; done
+for fs in dense_sparse uniform surrounding; do
+  python3 -c "import json,sys; m=json.load(open(sys.argv[1]))['overall']; print(sys.argv[2], m['metrics'], 'majority', m['majority']['metrics']['macro_f1'])" \
+    data/paper/eval/val_base_$fs/metrics.json $fs
+done
+```
+
+Берётся стратегия с лучшим macro-F1. Если лидер опережает `dense_sparse` меньше чем на 0.03 или все три на
+уровне majority, остаётся `dense_sparse`: на val около 230 эпизодов, такая разница — шум, а `dense_sparse` —
+лучшая zero-shot конфигурация InternVL3-2B в статье. Если выбрана другая стратегия, повторить шаг 1 с ней:
+разбивка от стратегии не зависит и не изменится.
+
+**3. Обучение** (в `tmux`; чекпоинт каждые полэпохи):
+
+```bash
+N=$(wc -l < data/paper/train.jsonl); SAVE=$(( (N + 31) / 32 ))   # полэпохи при эффективном батче 2 x 8 = 16
+DATA=data/paper WATCH_VAL=0 EXTRA_ARGS="--save_strategy steps --save_steps $SAVE" bash train.sh 2>&1 | tee train_paper.log
+```
+
+Возобновление: тот же запуск с `--resume_from_checkpoint $PWD/work_dirs/paper/checkpoint-K` в конце `EXTRA_ARGS`.
+
+**4. Оценка:**
+
+```bash
+B=$(cat work_dirs/paper/best_checkpoint.txt)
+python3 evaluate.py --data data/paper/heldout.jsonl --lora $B --group-by agent          # test, gt-метки
+python3 evaluate.py --data data/paper/heldout_human.jsonl --lora $B --group-by agent    # test, ручные метки
+python3 evaluate.py --data data/paper/heldout.jsonl --group-by agent                    # zero-shot 2B -> heldout_base
+python3 evaluate.py --data data/paper/heldout.jsonl --model OpenGVLab/InternVL3-8B --group-by agent   # -> heldout_base-InternVL3-8B
+```
+
+InternVL3-8B занимает около 16 ГБ в кэше HF. Скачивать его после обучения, без прокси и без offline-режима:
+`env -u http_proxy -u https_proxy -u all_proxy HF_HUB_DISABLE_XET=1 HF_HUB_OFFLINE=0 huggingface-cli download OpenGVLab/InternVL3-8B`.
 
 ## Скрипты
 

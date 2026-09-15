@@ -255,6 +255,40 @@ def section_topk(runs, data_fs, split):
                              "McNemar", "балл выбранных / отброшенных"], rows)])
 
 
+def section_efficiency(runs, data_fs, timing_path):
+    """Время из отдельного замера (timing.log цепочки final), качество — из полных прогонов на test."""
+    sec = load_timings([timing_path])
+    ft = [m for m in models_of(runs) if " + LoRA" in m]
+    if not sec or not ft:
+        return None
+    model = ft[-1]
+    ref = full_run(runs, "heldout", model, data_fs)
+    if not ref:
+        return None
+    full_times = [sec[k] for k in ("full", "full_again") if k in sec]
+    base_t = statistics.mean(full_times) if full_times else None
+    first = lambda cand: next(iter(cand), None)
+    variants = [("все токены", ref, base_t),
+                ("uniform", first(r for r in pick(runs, split="heldout", model=model, fs="uniform", ratio=None, topk=None)
+                                  if r["max_frames"] == DEFAULT_MAX_FRAMES), sec.get("uniform"))]
+    for ratio in (0.5, 0.2):
+        variants.append((f"DivPrune {ratio:g}", first(pick(runs, split="heldout", model=model, ratio=ratio, random=False, topk=None)),
+                         sec.get(f"tok{ratio:g}")))
+        variants.append((f"случайные {ratio:g}", first(pick(runs, split="heldout", model=model, ratio=ratio, random=True, topk=None)),
+                         sec.get(f"rand{ratio:g}")))
+    variants.append(("Top-K", first(r for r in pick(runs, split="heldout", model=model, ratio=None) if r["topk"]), sec.get("topk20")))
+    rows = [[label, f"{r['frames']:.1f}", f"{r['tokens']:.0f}", f"{t:.2f}", f"{t / base_t:.2f}×" if base_t else "—",
+             f3(r["metrics"]["macro_f1"]), f3(r["metrics"]["accuracy"]), "—" if r is ref else fmt_test(r, ref)]
+            for label, r, t in variants if r is not None and t is not None]
+    drift = (f" Все токены в начале и в конце замера: {full_times[0]:.2f} и {full_times[1]:.2f} с/эпизод."
+             if len(full_times) == 2 else "")
+    return "\n".join([f"## Эффективность: {model}",
+                      "Время — отдельный замер на первых 100 эпизодах test, прогоны по очереди без других задач на карте, "
+                      f"с чтением кадров, без загрузки модели; прогрев отброшен.{drift} Качество — на всех 400 эпизодах.", "",
+                      table(["вариант", "кадров", "токенов", "с/эпизод", "к всем токенам", "macro-F1", "acc",
+                             "McNemar против всех токенов"], rows)])
+
+
 def section_token_stats(runs, split):
     rows = []
     for model in models_of(runs):
@@ -300,8 +334,15 @@ def section_groups(runs, data_fs, split):
         rows.append([model] + cells)
     if not rows:
         return None
+    preds = list(full_run(runs, split, models_of(runs)[0], data_fs)["preds"].values())
+    maj = []
+    for k, v in keys:
+        c = Counter(p["gt"] for p in preds if p.get(k) == v)
+        maj.append(f"— / {max(c.values()) / sum(c.values()):.3f} ({c.most_common(1)[0][0]})" if c else "—")
+    rows.append(["majority внутри группы"] + maj)
     return "\n".join([f"## {split}: по агентам и задачам, полные токены",
-                      "В ячейке macro-F1 / accuracy; macro-F1 по классам, которые есть в группе.", "", table(header, rows)])
+                      "В ячейке macro-F1 / accuracy; macro-F1 по классам, которые есть в группе. Классы сильно зависят от "
+                      "агента, поэтому точность сравнивать с majority внутри той же группы.", "", table(header, rows)])
 
 
 def section_dataset(counts, labeler):
@@ -395,22 +436,26 @@ def section_prior(runs, data_fs, run_dir, priors):
         table(["сплит", "вариант", "macro-F1", "bal-acc", "acc"] + [f"recall {c}" for c in CLASSES] + ["McNemar"], rows)])
 
 
-def section_checkpoints(run_dir):
-    rows = []
+def section_checkpoints(run_dir, train_log=None):
+    rows = {}
     for path in glob.glob(os.path.join(run_dir, "checkpoint-*", "val_eval", "metrics.json")):
         ck = os.path.basename(os.path.dirname(os.path.dirname(path)))
         with open(path) as f:
             m = json.load(f)["overall"]["metrics"]
-        rows.append((int(ck.split("-")[-1]), ck, m))
+        rows[ck] = [ck, f3(m["macro_f1"]), f3(m["balanced_accuracy"]), f3(m["accuracy"])]
+    if train_log and os.path.exists(train_log):  # чекпоинты, удалённые после обучения, остались только в логе train.sh
+        with open(train_log, errors="replace") as f:
+            for line in f:
+                mm = re.search(r"(checkpoint-\d+)\s+val macro-F1 = ([\d.]+)", line)
+                if mm and mm.group(1) not in rows:
+                    rows[mm.group(1)] = [mm.group(1), f3(float(mm.group(2))), "—", "—"]
     if not rows:
         return None
-    rows.sort()
     best_path = os.path.join(run_dir, "best_checkpoint.txt")
     best = os.path.basename(open(best_path).read().strip()) if os.path.exists(best_path) else None
-    return "\n".join(["## Отбор чекпоинта по val", "", table(
-        ["чекпоинт", "macro-F1", "bal-acc", "acc", ""],
-        [[ck, f3(m["macro_f1"]), f3(m["balanced_accuracy"]), f3(m["accuracy"]), "выбран" if ck == best else ""]
-         for _, ck, m in rows])])
+    ordered = sorted(rows.values(), key=lambda r: int(r[0].split("-")[-1]))
+    return "\n".join(["## Отбор чекпоинта по val", "Прочерки — чекпоинты, от которых остался только лог train.sh.", "",
+                      table(["чекпоинт", "macro-F1", "bal-acc", "acc", ""], [r + ["выбран" if r[0] == best else ""] for r in ordered])])
 
 
 def main():
@@ -421,7 +466,10 @@ def main():
     ap.add_argument("--out", default=None, help="по умолчанию <eval-dir>/paper_tables.md")
     ap.add_argument("--labels", default=None, help="папка label_stats.py; по умолчанию <eval-dir>/../labels")
     ap.add_argument("--log", action="append", default=None,
-                    help="лог paper_evals.sh для времени на эпизод, можно несколько; по умолчанию paper_evals*.log в корне проекта")
+                    help="лог paper_evals.sh для времени на эпизод в таблицах прогонов; по умолчанию не берётся: в очереди "
+                         "прогоны делили карту, и время несравнимо")
+    ap.add_argument("--timing", default=None, help="timing.log отдельного замера; по умолчанию в корне проекта")
+    ap.add_argument("--train-log", default=None, help="лог train.sh с val macro-F1 чекпоинтов; по умолчанию train_paper.log в корне")
     ap.add_argument("--train", default=None, help="train.jsonl для долей классов в поправке; по умолчанию <eval-dir>/../train.jsonl")
     ap.add_argument("--keep-limited", action="store_true", help="не пропускать прогоны с --limit (смоук)")
     args = ap.parse_args()
@@ -433,7 +481,10 @@ def main():
             raise SystemExit(f"нет {cfg}: укажите --data-fs")
         with open(cfg) as f:
             data_fs = json.load(f)["frame_selection"]
-    logs = args.log if args.log is not None else sorted(glob.glob(os.path.join(eval_dir, "..", "..", "..", "paper_evals*.log")))
+    root = os.path.join(eval_dir, "..", "..", "..")
+    logs = args.log or []
+    timing_path = args.timing or os.path.join(root, "timing.log")
+    train_log = args.train_log or os.path.join(root, "train_paper.log")
     runs, skipped = load_runs(eval_dir, data_fs, args.keep_limited, load_timings(logs))
     labels_dir = args.labels or os.path.join(eval_dir, "..", "labels")
     counts_path = os.path.join(labels_dir, "label_counts.json")
@@ -449,7 +500,7 @@ def main():
         raise SystemExit(f"в {eval_dir} нет прогонов evaluate.py")
 
     sections = [
-        section_checkpoints(os.path.expanduser(args.run_dir)) if args.run_dir else None,
+        section_checkpoints(os.path.expanduser(args.run_dir), train_log) if args.run_dir else None,
         section_dataset(counts, labeler) if counts or labeler else None,
         section_strategies(runs, data_fs, "val"),
         section_main(runs, data_fs, "heldout", "Test: эпизоды из списка held-out, метки gt."),
@@ -461,10 +512,12 @@ def main():
         section_strategies(runs, data_fs, "heldout"),
         section_pruning(runs, data_fs, "heldout"),
         section_topk(runs, data_fs, "heldout"),
+        section_efficiency(runs, data_fs, timing_path) if os.path.exists(timing_path) else None,
         section_token_stats(runs, "heldout"),
     ]
     text = "\n\n".join(s for s in sections if s)
-    text += "\n\nВремя на эпизод из логов: " + (", ".join(logs) if logs else "логи не найдены")
+    if logs:
+        text += "\n\nВремя на эпизод в таблицах прогонов из логов очереди (несравнимо между прогонами): " + ", ".join(logs)
     if skipped:
         text += "\n\nПропущены:\n" + "\n".join(f"- {n}: {why}" for n, why in skipped)
     print(text)

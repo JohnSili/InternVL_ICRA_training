@@ -39,10 +39,11 @@ WAIT_HOURS=${WAIT_HOURS:-12}
 [ -f "$DATA/heldout.jsonl" ] || { echo "нет $DATA/heldout.jsonl"; exit 1; }
 
 wait_best() {
-  # best_checkpoint.txt должен быть свежее .train_done: train.sh удаляет .train_done на старте,
-  # создаёт в конце обучения и только потом отбирает чекпоинт по val
+  # best_checkpoint.txt должен быть от этого обучения, то есть новее run_config.json, который train.sh пишет
+  # на старте. Сравнивать с .train_done нельзя: train.sh трогает его ещё раз при выходе (trap EXIT), уже
+  # после записи best_checkpoint.txt, и условие никогда бы не выполнилось.
   local best="$RUN/best_checkpoint.txt" done="$RUN/.train_done" waited=0
-  until [ -f "$best" ] && [ -f "$done" ] && [ ! "$best" -ot "$done" ]; do
+  until [ -f "$best" ] && [ -f "$done" ] && [ "$best" -nt "$RUN/run_config.json" ]; do
     if [ -f "$done" ] && [ $(( $(date +%s) - $(stat -c %Y "$done") )) -gt 7200 ]; then
       echo "обучение завершилось больше 2 ч назад, а свежего $best нет: см. $RUN/training_log.txt"
       return 1

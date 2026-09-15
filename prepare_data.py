@@ -234,7 +234,10 @@ def pick_frames(ep, strategy, max_frames=MAX_FRAMES, num_surr=2, tail=0, rng=Non
     """Индексы кадров эпизода. Стратегии авторов берут ключевые кадры по смене команды гриппера, как
     find_gripper_change у них, и работают без джиттера; прежние стратегии дают ровно N_FRAMES."""
     if strategy in fsr.AUTHOR_STRATEGIES:
-        return fsr.select(strategy, ep["n_frames"], [t for t, _ in ep["flips"]], max_frames, num_surr, tail)
+        # набор кадров как у авторов, но по времени и без повторов: при tail > 0 их surrounding ставит хвост сразу
+        # после первого окна и может повторять кадры, а промпт обещает хронологический порядок. При tail = 0
+        # все три функции и так отдают кадры по времени без повторов, так что прежние результаты не меняются
+        return sorted(set(fsr.select(strategy, ep["n_frames"], [t for t, _ in ep["flips"]], max_frames, num_surr, tail)))
     return select_frames(ep["n_frames"], ep["flips"], strategy, rng, jitter)
 
 

@@ -402,6 +402,10 @@ def main():
         suffix += f"_{args.frame_selection}"
         if args.frame_selection in fsr.AUTHOR_STRATEGIES and args.max_frames != MAX_FRAMES:
             suffix += f"_mf{args.max_frames}"
+        if args.frame_selection in fsr.AUTHOR_STRATEGIES and args.num_surr != 2:
+            suffix += f"_surr{args.num_surr}"
+        if args.frame_selection in fsr.AUTHOR_STRATEGIES and args.tail:
+            suffix += f"_tail{args.tail}"
     if args.topk is not None:
         suffix += f"_topk{args.topk}" + (f"r{args.topk_ratio:g}" if args.topk_ratio != ap.get_default("topk_ratio") else "")
     if args.token_ratio is not None:
@@ -459,6 +463,8 @@ def main():
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(dict(s, data=args.data, model=args.model, lora=args.lora, frame_selection=args.frame_selection,
                        max_frames=args.max_frames if args.frame_selection in fsr.AUTHOR_STRATEGIES else None,
+                       num_surr=args.num_surr if args.frame_selection in fsr.AUTHOR_STRATEGIES else None,
+                       tail=args.tail if args.frame_selection in fsr.AUTHOR_STRATEGIES else None,
                        prune=prune, mean_frames=mean_frames, mean_visual_tokens=mean_tokens,
                        n=len(preds), failed=failed, group_by=args.group_by), f, indent=1)
     print(f"\nsaved {out_dir}/{{predictions.jsonl,metrics.json,run_config.json}}")

@@ -93,6 +93,7 @@ def load_runs(eval_dir, data_fs, keep_limited, timings):
             "model": model_name(m), "ft": bool(m.get("lora")),
             "fs": m.get("frame_selection") or data_fs, "reselected": bool(m.get("frame_selection")),
             "max_frames": m.get("max_frames") or DEFAULT_MAX_FRAMES,
+            "num_surr": 2 if m.get("num_surr") is None else m["num_surr"], "tail": m.get("tail") or 0,
             "ratio": prune.get("token_ratio"), "random": bool(prune.get("token_random")), "topk": prune.get("topk"),
             "metrics": m["overall"]["metrics"], "majority": m["overall"]["majority"],
             "frames": m.get("mean_frames"), "tokens": m.get("mean_visual_tokens"),
@@ -140,7 +141,7 @@ def pick(runs, **kw):
 
 def full_run(runs, split, model, data_fs):
     """Полные токены, стратегия данных; прогон без пересборки кадров предпочтительнее."""
-    cand = [r for r in pick(runs, split=split, model=model, fs=data_fs, ratio=None, topk=None)
+    cand = [r for r in pick(runs, split=split, model=model, fs=data_fs, ratio=None, topk=None, num_surr=2, tail=0)
             if r["max_frames"] == DEFAULT_MAX_FRAMES]
     cand.sort(key=lambda r: r["reselected"])
     return cand[0] if cand else None
@@ -181,7 +182,7 @@ def section_strategies(runs, data_fs, split):
     for model in models_of(runs):
         ref = full_run(runs, split, model, data_fs)
         for fs in STRATEGIES:
-            cand = sorted([r for r in pick(runs, split=split, model=model, fs=fs, ratio=None, topk=None)
+            cand = sorted([r for r in pick(runs, split=split, model=model, fs=fs, ratio=None, topk=None, num_surr=2, tail=0)
                            if r["max_frames"] == DEFAULT_MAX_FRAMES], key=lambda r: r["reselected"])
             if not cand:
                 continue
@@ -195,6 +196,33 @@ def section_strategies(runs, data_fs, split):
     return "\n".join([f"## {split}: стратегии отбора кадров (бюджет {DEFAULT_MAX_FRAMES})",
                       f"Последний столбец: McNemar против {data_fs} той же модели, прав только эта стратегия / только {data_fs}.",
                       "", table(["модель", "кадры", "n", "macro-F1", "bal-acc", "acc", "кадров", "токенов", "с/эпизод", "McNemar"], rows)])
+
+
+def section_tail(runs, data_fs, split):
+    """tail(n) из статьи: последние n кадров эпизода вдобавок к окнам вокруг смен гриппера."""
+    rows = []
+    for model in models_of(runs):
+        ref = full_run(runs, split, model, data_fs)
+        for fs in STRATEGIES:
+            same = [r for r in pick(runs, split=split, model=model, fs=fs, ratio=None, topk=None, num_surr=2)
+                    if r["max_frames"] == DEFAULT_MAX_FRAMES]
+            tails = sorted((r for r in same if r["tail"] > 0), key=lambda r: r["tail"])
+            if not tails:
+                continue
+            base = next(iter(sorted((r for r in same if r["tail"] == 0), key=lambda r: r["reselected"])), None)
+            for r in ([base] if base else []) + tails:
+                m = r["metrics"]
+                rows.append([model, fs, r["tail"], m["n"], f3(m["macro_f1"]), f3(m["balanced_accuracy"]), f3(m["accuracy"]),
+                             f3(m["recall"].get("D")), f"{r['frames']:.1f}" if r["frames"] else "—",
+                             "эталон" if r is base else (fmt_test(r, base) if base else "—"),
+                             "—" if ref is None or r is ref else fmt_test(r, ref)])
+    if not rows:
+        return None
+    return "\n".join([f"## {split}: хвост эпизода tail(n)",
+                      "tail(n) добавляет последние n кадров эпизода к кадрам стратегии (набор кадров как в коде авторов, "
+                      "подаются по времени без повторов). McNemar: против той же стратегии без хвоста и против стратегии данных.", "",
+                      table(["модель", "кадры", "tail", "n", "macro-F1", "bal-acc", "acc", "recall D", "кадров",
+                             "McNemar против tail 0", f"McNemar против {data_fs}"], rows)])
 
 
 def section_pruning(runs, data_fs, split):
@@ -269,7 +297,7 @@ def section_efficiency(runs, data_fs, timing_path):
     base_t = statistics.mean(full_times) if full_times else None
     first = lambda cand: next(iter(cand), None)
     variants = [("все токены", ref, base_t),
-                ("uniform", first(r for r in pick(runs, split="heldout", model=model, fs="uniform", ratio=None, topk=None)
+                ("uniform", first(r for r in pick(runs, split="heldout", model=model, fs="uniform", ratio=None, topk=None, tail=0)
                                   if r["max_frames"] == DEFAULT_MAX_FRAMES), sec.get("uniform"))]
     for ratio in (0.5, 0.2):
         variants.append((f"DivPrune {ratio:g}", first(pick(runs, split="heldout", model=model, ratio=ratio, random=False, topk=None)),
@@ -503,6 +531,7 @@ def main():
         section_checkpoints(os.path.expanduser(args.run_dir), train_log) if args.run_dir else None,
         section_dataset(counts, labeler) if counts or labeler else None,
         section_strategies(runs, data_fs, "val"),
+        section_tail(runs, data_fs, "val"),
         section_main(runs, data_fs, "heldout", "Test: эпизоды из списка held-out, метки gt."),
         section_main(runs, data_fs, "heldout_human",
                      "Человеческий тест: эпизоды с ручной разметкой, метки людей. Строка gt-разметчика — согласие "
@@ -510,6 +539,7 @@ def main():
         section_groups(runs, data_fs, "heldout"),
         section_prior(runs, data_fs, os.path.expanduser(args.run_dir), priors) if args.run_dir and priors else None,
         section_strategies(runs, data_fs, "heldout"),
+        section_tail(runs, data_fs, "heldout"),
         section_pruning(runs, data_fs, "heldout"),
         section_topk(runs, data_fs, "heldout"),
         section_efficiency(runs, data_fs, timing_path) if os.path.exists(timing_path) else None,

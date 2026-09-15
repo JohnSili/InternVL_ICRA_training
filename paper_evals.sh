@@ -9,6 +9,7 @@
 #
 #   bash paper_evals.sh 2>&1 | tee paper_evals.log                    # во время или после обучения data/paper
 #   MODELS=base MODEL=OpenGVLab/InternVL3-8B bash paper_evals.sh       # zero-shot 8B, без ожидания
+#   ABLATIONS=strategies MODELS=base MODEL=OpenGVLab/InternVL3-8B bash paper_evals.sh   # 8B без прунинга и Top-K
 #   LIMIT=5 RATIOS=0.5 MODELS=base bash paper_evals.sh                 # смоук
 set -uo pipefail
 
@@ -27,6 +28,11 @@ FS=${FS:-$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['fra
 POOL=${POOL:-30}
 TOPK=${TOPK:-20}
 RATIOS=${RATIOS:-0.2 0.5 0.7}
+ABLATIONS=${ABLATIONS:-strategies prune topk}  # что считать сверх полных токенов на heldout и heldout_human
+for a in $ABLATIONS; do
+  case "$a" in strategies|prune|topk) ;; *) echo "ABLATIONS: strategies, prune, topk, а не $a"; exit 1 ;; esac
+done
+has() { [[ " $ABLATIONS " == *" $1 "* ]]; }
 LIMIT=${LIMIT:-}
 WAIT_HOURS=${WAIT_HOURS:-12}
 
@@ -97,16 +103,22 @@ for m in $MODELS; do
   if [ -f "$DATA/heldout_human.jsonl" ]; then
     run "$E/heldout_human_$tag$sfx" --data "$DATA/heldout_human.jsonl" $margs
   fi
-  for s in uniform dense_sparse surrounding; do  # таблица стратегий кадров; стратегия данных уже посчитана выше
-    [ "$s" = "$FS" ] && continue
-    run "$E/heldout_${tag}_$s$sfx" --data "$DATA/heldout.jsonl" --frame-selection "$s" $margs
-  done
-  for r in $RATIOS; do
-    run "$E/heldout_${tag}_tok$r$sfx" --data "$DATA/heldout.jsonl" --token-ratio "$r" $margs
-    run "$E/heldout_${tag}_rand$r$sfx" --data "$DATA/heldout.jsonl" --token-ratio "$r" --token-random $margs
-  done
-  run "$E/heldout_${tag}_${FS}_mf${POOL}_topk$TOPK$sfx" --data "$DATA/heldout.jsonl" \
-    --frame-selection "$FS" --max-frames "$POOL" --topk "$TOPK" $margs
+  if has strategies; then
+    for s in uniform dense_sparse surrounding; do  # таблица стратегий кадров; стратегия данных уже посчитана выше
+      [ "$s" = "$FS" ] && continue
+      run "$E/heldout_${tag}_$s$sfx" --data "$DATA/heldout.jsonl" --frame-selection "$s" $margs
+    done
+  fi
+  if has prune; then
+    for r in $RATIOS; do
+      run "$E/heldout_${tag}_tok$r$sfx" --data "$DATA/heldout.jsonl" --token-ratio "$r" $margs
+      run "$E/heldout_${tag}_rand$r$sfx" --data "$DATA/heldout.jsonl" --token-ratio "$r" --token-random $margs
+    done
+  fi
+  if has topk; then
+    run "$E/heldout_${tag}_${FS}_mf${POOL}_topk$TOPK$sfx" --data "$DATA/heldout.jsonl" \
+      --frame-selection "$FS" --max-frames "$POOL" --topk "$TOPK" $margs
+  fi
 done
 
 echo

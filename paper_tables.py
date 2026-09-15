@@ -332,6 +332,69 @@ def section_dataset(counts, labeler):
     return "\n".join(out)
 
 
+PRIOR_TAUS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+
+
+def train_priors(path):
+    with open(path) as f:
+        c = Counter(json.loads(l)["cls"] for l in f if l.strip())
+    n = sum(c.values())
+    return {k: c.get(k, 0) / n for k in CLASSES}
+
+
+def adjust(preds, priors, tau):
+    """Logit adjustment: класс = argmax_c log p_c − τ·log π_c; при равенстве — более ранняя буква."""
+    out = {}
+    for i, p in preds.items():
+        score = {c: math.log(max(p["probs"][c], 1e-6)) - tau * math.log(max(priors[c], 1e-6)) for c in CLASSES}
+        out[i] = dict(p, pred=max(CLASSES, key=lambda c: (score[c], -CLASSES.index(c))))
+    return out
+
+
+def section_prior(runs, data_fs, run_dir, priors):
+    """Поправка дообученной модели на дисбаланс классов без переобучения; τ выбирается только на val."""
+    title = "## Поправка на частоту классов (logit adjustment)"
+    best_path = os.path.join(run_dir, "best_checkpoint.txt")
+    if not os.path.exists(best_path):
+        return f"{title}\nпропущено: нет {best_path}"
+    with open(best_path) as f:
+        ck = os.path.basename(f.read().strip())
+    val_path = os.path.join(run_dir, ck, "val_eval", "predictions.jsonl")
+    model = next((m for m in models_of(runs) if m.endswith(f"({ck})")), None)
+    if not os.path.exists(val_path):
+        return f"{title}\nпропущено: нет {val_path}, τ не на чем выбрать"
+    if model is None:
+        return f"{title}\nпропущено: среди прогонов нет модели с лучшим чекпоинтом {ck}"
+    val = {p["id"]: p for p in load_jsonl(val_path)}
+    grid = []
+    for tau in PRIOR_TAUS:
+        ys = list(adjust(val, priors, tau).values())
+        grid.append((tau, metrics([p["gt"] for p in ys], [p["pred"] for p in ys])["macro_f1"]))
+    best_tau = max(grid, key=lambda x: (round(x[1], 9), -x[0]))[0]  # при равенстве — меньший τ
+    rows = []
+    for split in ("heldout", "heldout_human"):
+        ref = full_run(runs, split, model, data_fs)
+        if not ref:
+            continue
+        preds = adjust(ref["preds"], priors, best_tau)
+        ys = list(preds.values())
+        adj = dict(ref, preds=preds, metrics=metrics([p["gt"] for p in ys], [p["pred"] for p in ys]),
+                   dir=f"{ref['dir']}+tau{best_tau:g}")
+        for label, r in (("без поправки", ref), (f"τ={best_tau:g}", adj)):
+            m = r["metrics"]
+            rows.append([split, label, f3(m["macro_f1"]), f3(m["balanced_accuracy"]), f3(m["accuracy"])]
+                        + [f3(m["recall"].get(c)) for c in CLASSES] + [fmt_test(adj, ref) if r is adj else "—"])
+    if not rows:
+        return None
+    return "\n".join([
+        f"## {model}: поправка на частоту классов (logit adjustment)",
+        "score_c = log p_c − τ·log π_c, π — доли классов в train: " + ", ".join(f"{c} {priors[c]:.3f}" for c in CLASSES) + ".",
+        f"τ выбран по macro-F1 на val ({len(val)} эпизодов) чекпоинта {ck}: "
+        + ", ".join(f"τ={t:g} → {v:.3f}" for t, v in grid) + f"; выбран τ={best_tau:g}. На test и человеческом тесте "
+        "τ не подбирался. McNemar: прав только вариант с поправкой / только без.", "",
+        table(["сплит", "вариант", "macro-F1", "bal-acc", "acc"] + [f"recall {c}" for c in CLASSES] + ["McNemar"], rows)])
+
+
 def section_checkpoints(run_dir):
     rows = []
     for path in glob.glob(os.path.join(run_dir, "checkpoint-*", "val_eval", "metrics.json")):
@@ -359,6 +422,7 @@ def main():
     ap.add_argument("--labels", default=None, help="папка label_stats.py; по умолчанию <eval-dir>/../labels")
     ap.add_argument("--log", action="append", default=None,
                     help="лог paper_evals.sh для времени на эпизод, можно несколько; по умолчанию paper_evals*.log в корне проекта")
+    ap.add_argument("--train", default=None, help="train.jsonl для долей классов в поправке; по умолчанию <eval-dir>/../train.jsonl")
     ap.add_argument("--keep-limited", action="store_true", help="не пропускать прогоны с --limit (смоук)")
     args = ap.parse_args()
     eval_dir = os.path.expanduser(args.eval_dir)
@@ -379,6 +443,8 @@ def main():
         with open(counts_path) as f:
             counts = json.load(f)
     labeler = labeler_run(labeler_path) if os.path.exists(labeler_path) else None
+    train_path = args.train or os.path.join(eval_dir, "..", "train.jsonl")
+    priors = train_priors(train_path) if os.path.exists(train_path) else None
     if not runs:
         raise SystemExit(f"в {eval_dir} нет прогонов evaluate.py")
 
@@ -391,6 +457,7 @@ def main():
                      "Человеческий тест: эпизоды с ручной разметкой, метки людей. Строка gt-разметчика — согласие "
                      "автоматической разметки с людьми, это не модель.", labeler),
         section_groups(runs, data_fs, "heldout"),
+        section_prior(runs, data_fs, os.path.expanduser(args.run_dir), priors) if args.run_dir and priors else None,
         section_strategies(runs, data_fs, "heldout"),
         section_pruning(runs, data_fs, "heldout"),
         section_topk(runs, data_fs, "heldout"),

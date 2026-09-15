@@ -18,3 +18,7 @@ data/cls/*
 
 # результаты обучения и оценок
 work_dirs/
+
+# результаты с сервера для таблиц статьи
+server_results/
+paper_results.tgz

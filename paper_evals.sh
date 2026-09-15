@@ -62,7 +62,8 @@ failed=()
 run() {  # run <out_dir> <аргументы evaluate.py>
   local out="$1"
   shift
-  if [ -f "$out/metrics.json" ]; then
+  # готов только читаемый metrics.json: при падении сервера во время записи файл остаётся пустым
+  if python3 -c "import json, sys; json.load(open(sys.argv[1]))" "$out/metrics.json" 2>/dev/null; then
     echo "готово, пропускаю: $out"
     return
   fi

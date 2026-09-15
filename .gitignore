@@ -22,3 +22,6 @@ work_dirs/
 # результаты с сервера для таблиц статьи
 server_results/
 paper_results.tgz
+tail_results.tgz
+paper_extras.tgz
+ckpt904.tar

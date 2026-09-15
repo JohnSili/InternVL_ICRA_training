@@ -371,10 +371,32 @@ def main():
         if not preds:
             sys.exit(f"пусто: {args.from_predictions}")
         s = summarize(preds, args.group_by)
-        print_summary(s, os.path.basename(os.path.dirname(os.path.abspath(args.from_predictions))))
-        out = os.path.join(os.path.dirname(os.path.abspath(args.from_predictions)), "metrics.json")
+        run_dir = os.path.dirname(os.path.abspath(args.from_predictions))
+        print_summary(s, os.path.basename(run_dir))
+        extra = {}
+        cfg_path = os.path.join(run_dir, "run_config.json")
+        if os.path.exists(cfg_path):
+            # описание прогона из run_config.json: без него paper_tables.py не поймёт, что это за прогон
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            a = cfg.get("args", {})
+            author = a.get("frame_selection") in fsr.AUTHOR_STRATEGIES
+            prune = None
+            if a.get("token_ratio") is not None or a.get("topk") is not None:
+                prune = {k: a.get(k) for k in ("token_ratio", "token_random", "topk", "topk_ratio", "seed")}
+            n_records = cfg.get("n_records")
+            if n_records is not None and n_records != len(preds):
+                print(f"внимание: в predictions.jsonl {len(preds)} строк, а в прогоне было {n_records} эпизодов", file=sys.stderr)
+            extra = dict(data=a.get("data"), model=a.get("model"), lora=a.get("lora"), frame_selection=a.get("frame_selection"),
+                         max_frames=a.get("max_frames") if author else None, num_surr=a.get("num_surr") if author else None,
+                         tail=a.get("tail") if author else None, prune=prune,
+                         mean_frames=sum(p["n_frames"] for p in preds) / len(preds) if all("n_frames" in p for p in preds) else None,
+                         mean_visual_tokens=(sum(p["n_visual_tokens"] for p in preds) / len(preds)
+                                             if all("n_visual_tokens" in p for p in preds) else None),
+                         failed=(n_records - len(preds)) if n_records is not None else None)
+        out = os.path.join(run_dir, "metrics.json")
         with open(out, "w") as f:
-            json.dump(dict(s, source=args.from_predictions, n=len(preds), group_by=args.group_by), f, indent=1)
+            json.dump(dict(s, **extra, source=args.from_predictions, n=len(preds), group_by=args.group_by), f, indent=1)
         print(f"\nsaved {out}")
         if args.tensorboard:
             log_tensorboard(s, args.tensorboard, tb_step, tb_tag)

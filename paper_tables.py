@@ -72,8 +72,12 @@ def load_runs(eval_dir, data_fs, keep_limited, timings):
     for path in sorted(glob.glob(os.path.join(eval_dir, "*", "metrics.json"))):
         d = os.path.dirname(path)
         name = os.path.basename(d)
-        with open(path) as f:
-            m = json.load(f)
+        try:
+            with open(path) as f:
+                m = json.load(f)
+        except ValueError:  # сервер упал при записи: evaluate.py --from-predictions пересчитает, если предсказания полные
+            skipped.append((name, "metrics.json не читается"))
+            continue
         cfg_path = os.path.join(d, "run_config.json")
         args = {}
         if os.path.exists(cfg_path):
